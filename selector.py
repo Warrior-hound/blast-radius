@@ -1233,6 +1233,145 @@ def lpt_pack(ms, chosen):
     return best[1]
 
 
+# ---------------------------------------------------------------- R1 infection-witness map
+
+R1 = os.environ.get("RWX_R1", "1") == "1"  # on by default; act only when no test is infected
+R1_MODE = os.environ.get("RWX_R1_MODE", "empty")  # empty: act only when no test is infected
+R1_MAP = Path(os.environ.get("RWX_R1_MAP", APP / "r1map.json.gz"))
+_R1_OPS = [ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.Is, ast.IsNot, ast.In, ast.NotIn]
+
+
+_R1_DEF = re.compile(r"^([ \t]*)(?:async[ \t]+)?def[ \t]")
+
+
+def _indent(line):
+    return len(line) - len(line.lstrip())
+
+
+def operator_swaps(old_text, new_text):
+    """operator_swaps_in on the smallest enclosing def of the changed lines (parsing a whole large
+    module costs ~0.2 s); the whole file when that snippet cannot be isolated or parsed."""
+    ol, nl = old_text.split("\n"), new_text.split("\n")
+    if len(ol) == len(nl):
+        changed = [i for i in range(len(ol)) if ol[i] != nl[i]]
+        if changed:
+            i0 = changed[0]
+            j = i0
+            while j >= 0:
+                m = _R1_DEF.match(ol[j])
+                if m and len(m.group(1)) < _indent(ol[i0]):
+                    break
+                j -= 1
+            if j >= 0:
+                ind = _indent(ol[j])
+                k = j + 1
+                while k < len(ol) and (not ol[k].strip() or _indent(ol[k]) > ind):
+                    k += 1
+                if changed[-1] < k:
+                    pre = "if 1:\n" if ind else ""
+                    r = operator_swaps_in(pre + "\n".join(ol[j:k]), pre + "\n".join(nl[j:k]), j - (1 if pre else 0))
+                    if r != "err":
+                        return r
+    r = operator_swaps_in(old_text, new_text)
+    return None if r == "err" else r
+
+
+def operator_swaps_in(old_text, new_text, line_off=0):
+    """If new_text differs from old_text only in the operator of single-operator comparisons or of
+    whole boolean operations, return [(kind, "l:c:el:ec" of the old node, new op index)]; else None.
+    kind 'c': Compare (op index into _R1_OPS); 'b': BoolOp (0 and, 1 or)."""
+    try:
+        o, n = ast.parse(old_text), ast.parse(new_text)
+    except (SyntaxError, ValueError):
+        return "err"
+    on, nn = list(ast.walk(o)), list(ast.walk(n))
+    if len(on) != len(nn):
+        return None
+    swaps = []
+    for a, b in zip(on, nn):
+        if type(a) is not type(b):
+            if (isinstance(a, ast.cmpop) and isinstance(b, ast.cmpop)) or (
+                    isinstance(a, ast.boolop) and isinstance(b, ast.boolop)):
+                continue
+            return None
+        if getattr(a, "lineno", None) != getattr(b, "lineno", None) or getattr(a, "end_lineno", None) != getattr(b, "end_lineno", None):
+            return None
+        for f in a._fields:
+            va, vb = getattr(a, f, None), getattr(b, f, None)
+            if isinstance(va, list):
+                if not isinstance(vb, list) or len(va) != len(vb):
+                    return None
+                if [type(x) if isinstance(x, ast.AST) else ("v", x) for x in va] != [
+                        type(x) if isinstance(x, ast.AST) else ("v", x) for x in vb]:
+                    if not all(isinstance(x, (ast.cmpop, ast.boolop)) for x in va + vb):
+                        return None
+            elif not isinstance(va, ast.AST) and va != vb:
+                return None
+        key = (f"{a.lineno + line_off}:{a.col_offset}:{a.end_lineno + line_off}:{a.end_col_offset}"
+               if hasattr(a, "lineno") else None)
+        if isinstance(a, ast.Compare) and [type(x) for x in a.ops] != [type(x) for x in b.ops]:
+            if len(a.ops) != 1:
+                return None
+            swaps.append(("c", key, _R1_OPS.index(type(b.ops[0]))))
+        elif isinstance(a, ast.BoolOp) and type(a.op) is not type(b.op):
+            swaps.append(("b", key, 0 if isinstance(b.op, ast.And) else 1))
+    return swaps or None
+
+
+_SWAP_TOKENS = re.compile(r"\b(?:and|or|is|not|in)\b|==|!=|<=|>=|<|>|\s+")
+
+
+def maybe_operator_swap(hunks):
+    """Cheap pre-check on the diff text: every removed line pairs with an added line that differs only
+    in comparison/boolean operator tokens and whitespace. Only then are both files parsed."""
+    for _os, _ol, _ns, _nl, body in hunks:
+        rem = [l[1:] for l in body if l.startswith("-")]
+        add = [l[1:] for l in body if l.startswith("+")]
+        if not rem or len(rem) != len(add):
+            return False
+        for r, n in zip(rem, add):
+            if r == n or _SWAP_TOKENS.sub("", r) != _SWAP_TOKENS.sub("", n):
+                return False
+    return True
+
+
+class WitnessMap:
+    def __init__(self, path, number):
+        self.path, self.number, self.loaded = path, number, False
+
+    def _load(self):
+        self.loaded = True
+        self.sets, self.sites = [], {}  # a failed read leaves an empty map: every site is unknown -> fallback
+        number = self.number
+        with gzip.open(self.path, "rt", encoding="utf-8") as fh:
+            m = json.load(fh)
+        idx = [number.get(t) for t in m["tests"]]
+        self.sets = [frozenset(idx[i] for i in s if idx[i] is not None) for s in m["sets"]]
+        self.sites = m["sites"]
+        self.skipped = {f: set(v) for f, v in m["skipped"].items()}
+        self.missing = {number[t] for t in m["missing"] if t in number}
+
+    def select(self, path, swaps):
+        """Tests witnessing every swap, or None when the map cannot decide (fall back)."""
+        if not self.loaded:
+            self._load()
+        d = self.sites.get(path)
+        if d is None:
+            return None
+        out = set()
+        for kind, key, new_op in swaps:
+            s = d.get(key)
+            if s is None or s[0] != kind:
+                return None
+            k, op, ex, alts, col = s
+            bit = 1 << (new_op + 1) if kind == "c" else 2
+            if col & bit:
+                return None  # witnessed while importing: every user of the module is exposed
+            sid = alts.get(str(new_op if kind == "c" else 0), ex)
+            out |= self.sets[sid]
+        return out
+
+
 class Selector:
     def __init__(self, map_path, tests):
         m = _load_compact_map(map_path)
@@ -1266,6 +1405,7 @@ class Selector:
                 self.e1_nums = set(self.e1_ids)
             except Exception:  # noqa: BLE001  E1 is optional: without it every test it would judge is kept
                 self.e1, self.e1_nums, self.e1_ids = None, set(), {}
+        self.r1 = WitnessMap(R1_MAP, self.number) if R1 and R1_MAP.exists() else None
         self.by_file = {}
         for t in tests:
             self.by_file.setdefault(t["file"], set()).add(t["number"])
@@ -1505,7 +1645,27 @@ class Selector:
                 chosen |= sel
                 why.append(f"{old}: syntax error -> users of it and its {len(files_) - 1} importers: {len(sel)}")
                 continue
-            sel = set()
+            r1_sel = None
+            try:
+                if self.r1 is not None and old.startswith("sqlglot/") and maybe_operator_swap(f["hunks"]):
+                    # R1: the file's ONLY change is mapped operator swaps. When no evaluation anywhere in
+                    # the suite is infected by them (RWX_R1_MODE=empty), no test can see them: the
+                    # line-coverage selection for the file is empty. The guards below still widen.
+                    swaps = operator_swaps(old_text, new_text)
+                    r1_sel = self.r1.select(old, swaps) if swaps else None
+                    if r1_sel is not None:
+                        # tests without a witness record: keep the ones that ran the file
+                        r1_sel |= self.touching(old) & self.r1.missing
+                    if r1_sel and R1_MODE != "partial":
+                        # some test was infected: a later test can reuse state the infected evaluation
+                        # left behind (module-level memo tables), so per-test attribution is not safe.
+                        why.append(f"{old}: operator swap witnessed by {len(r1_sel)} tests -> regions")
+                        r1_sel = None
+                    if r1_sel is not None:
+                        why.append(f"{old}: {len(swaps)} operator swap(s) -> witnesses {len(r1_sel)}")
+            except Exception:  # noqa: BLE001  R1 is optional: on any failure the file gets the v7d selection
+                r1_sel = None
+            sel = set() if r1_sel is None else set(r1_sel)
             tiers[1] |= self.file_tests(old)
             tiers[2] |= self.class_users(old, "<module>")
             col = self.collect.get(old, set())
@@ -1525,9 +1685,9 @@ class Selector:
                 else:
                     narrowed += 1
                 hit = set()
-                for a, b in ranges:
+                for a, b in ranges if r1_sel is None else ():  # R1 decided the file's covered tests
                     hit |= self.touching(old, a, b)
-                if self.e1 and kind == "func" and not at_import and old.startswith("sqlglot/"):
+                if self.e1 and r1_sel is None and kind == "func" and not at_import and old.startswith("sqlglot/"):
                     e1_soft.append((old, ranges, hit & self.e1_nums))
                     hit = hit - self.e1_nums  # decided after the loop, by the boundary check
                 sel |= hit
