@@ -317,7 +317,7 @@ class Finder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
             module.__path__ = [origin.rsplit("/", 1)[0]]
         module.__file__ = origin
         exec(compile(src, origin, "exec"), module.__dict__)
-sys.setrecursionlimit(100000)
+sys.setrecursionlimit(900)  # below the real tests' default 1000 (pytest adds frames): deeper recursion must differ -> keep
 sys.path.insert(0, root)
 sys.meta_path.insert(0, Finder())
 sys.path.insert(0, app)
@@ -388,16 +388,16 @@ class Cutoff:
         qs = set()
         for path, ranges in regions:
             ex = d["E"].get(path, ())
-            hit_any = False
             for lo, hi in ranges:
                 if any(lo <= ln <= hi for ln in ex):
                     return None  # the changed statement runs in the execute phase
+                hit = False
                 for i, q in enumerate(d["Q"]):
                     if any(lo <= ln <= hi for ln in q.get(path, ())):
                         qs.add(i)
-                        hit_any = True
-            if not hit_any:
-                return None  # the map says the test ran it, the phase trace did not: be safe
+                        hit = True
+                if not hit:
+                    return None  # per range: the map says the test ran it, the phase trace did not: be safe
         return sorted(qs)
 
     def droppable(self, src_root, patched_files, wants):

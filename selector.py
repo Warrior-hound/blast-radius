@@ -540,6 +540,13 @@ def statement_ranges(oco, nco, old_fi, new_fi, diff):
 _compiled = {}
 
 
+def _src_bytes(text):
+    """Source as the import system sees it: bytes, so a PEP 263 encoding cookie on line 1-2 is
+    honoured (compiling a str ignores the cookie: a cookie edit would look bytecode-identical while
+    the real import fails or decodes the literals differently)."""
+    return text.encode("utf-8", "surrogatepass")
+
+
 CACHE = APP / "cache"  # written at image build (`selector.py --precompute`); every use is checked
 
 
@@ -552,7 +559,7 @@ def compile_old(path, text):
     if co is None:
         co = _load_old_code(path, text)
         if co is None:
-            co = compile(text, path, "exec", dont_inherit=True)
+            co = compile(_src_bytes(text), path, "exec", dont_inherit=True)
         _compiled[path] = co
     return co
 
@@ -581,7 +588,7 @@ def code_changes(path, old_text, new_text, hunks=None):
     code object's full span. With the hunks, an edited function is narrowed to the statements the
     edit touches (statement_ranges)."""
     try:
-        new_co = compile(new_text, path, "exec", dont_inherit=True)
+        new_co = compile(_src_bytes(new_text), path, "exec", dont_inherit=True)
     except (SyntaxError, ValueError):
         return "syntax", []
     old_co = compile_old(path, old_text)
@@ -635,6 +642,176 @@ def code_changes(path, old_text, new_text, hunks=None):
     return "changed", regions
 
 
+# ---------------------------------------------------------------- module-level names (static)
+
+_DEF = (ast.FunctionDef, ast.AsyncFunctionDef)
+_COMPOUND = (ast.If, ast.Try, ast.With, ast.AsyncWith, ast.For, ast.AsyncFor) + (
+    (ast.TryStar,) if hasattr(ast, "TryStar") else ())
+
+
+def _bound(t, out):
+    if isinstance(t, ast.Name):
+        out.add(t.id)
+        return True
+    if isinstance(t, (ast.Tuple, ast.List)):
+        return all([_bound(e, out) for e in t.elts])
+    if isinstance(t, ast.Starred):
+        return _bound(t.value, out)
+    return False  # attribute / subscript store: mutates another object
+
+
+def _sig(node):
+    """ast.dump of a statement with a function's body left out (the body is its own code object,
+    compared on its own): what binding the name means to a reader of the module."""
+    if isinstance(node, _DEF):
+        body, node.body = node.body, []
+        try:
+            return ast.dump(node)
+        finally:
+            node.body = body
+    return ast.dump(node)
+
+
+def _top_level(tree):
+    """{name: [signatures of the top-level statements binding it]}, [signatures of top-level
+    statements with effects beyond binding names (calls, attribute/subscript stores, ...)]."""
+    names, effects = {}, []
+
+    def visit(stmts):
+        for n in stmts:
+            bound, pure = set(), True
+            if isinstance(n, (ast.Import, ast.ImportFrom)):
+                for a in n.names:
+                    bound.add((a.asname or a.name).split(".")[0])
+                    if a.name == "*":
+                        pure = False
+            elif isinstance(n, ast.ClassDef):
+                continue  # class bodies: their users come from the map's class users
+            elif isinstance(n, _DEF):
+                bound.add(n.name)
+            elif isinstance(n, ast.Assign):
+                pure = all([_bound(t, bound) for t in n.targets])
+            elif isinstance(n, (ast.AnnAssign, ast.AugAssign)):
+                pure = _bound(n.target, bound)
+            elif isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant):
+                continue  # docstring / bare literal
+            elif isinstance(n, ast.Pass):
+                continue
+            elif isinstance(n, _COMPOUND):
+                saved = {f: getattr(n, f) for f in ("body", "orelse", "finalbody", "handlers") if hasattr(n, f)}
+                for f in saved:
+                    setattr(n, f, [])
+                try:
+                    head = ast.dump(n)
+                finally:
+                    for f, v in saved.items():
+                        setattr(n, f, v)
+                inner_names, inner_effects = _top_level(ast.Module(
+                    body=[x for f in ("body", "orelse", "finalbody") for x in saved.get(f, [])]
+                    + [x for h in saved.get("handlers", []) for x in h.body], type_ignores=[]))
+                for k, v in inner_names.items():
+                    names.setdefault(k, []).extend([head] + v)
+                effects.extend([head + e for e in inner_effects])
+                if isinstance(n, (ast.For, ast.AsyncFor)) and not _bound(n.target, set()):
+                    effects.append(head)
+                continue
+            else:
+                pure = False
+            sig = _sig(n)
+            for b in bound:
+                names.setdefault(b, []).append(sig)
+            if not pure:
+                effects.append(sig)
+    visit(tree.body)
+    return names, effects
+
+
+def top_level_changes(old_text, new_text):
+    """(names whose top-level binding changed or disappeared, names added, effects changed?)."""
+    on, oe = _top_level(ast.parse(old_text))
+    nn, ne = _top_level(ast.parse(new_text))
+    changed = {k for k, v in on.items() if sorted(v) != sorted(nn.get(k, []))}
+    added = set(nn) - set(on)
+    return changed, added, sorted(oe) != sorted(ne)
+
+
+def name_reads(text, names):
+    """Line ranges inside function bodies where the module loads one of `names` (directly, via an
+    `as` alias of `from ... import NAME`, or as an attribute `mod.NAME`); None when any load happens
+    at import scope (module level, class bodies, decorators, defaults)."""
+    tree = ast.parse(text)
+    want = set(names)
+    for n in ast.walk(tree):
+        if isinstance(n, ast.ImportFrom):
+            for al in n.names:
+                if al.name in names and al.asname:
+                    want.add(al.asname)
+    out = []
+
+    def walk(node, in_func):
+        for c in ast.iter_child_nodes(node):
+            if isinstance(c, (ast.Import, ast.ImportFrom)):
+                continue  # binding the name is not reading it
+            if isinstance(c, (ast.Name, ast.Attribute)) and (c.id if isinstance(c, ast.Name) else c.attr) in want \
+                    and isinstance(c.ctx, ast.Load):
+                if not in_func:
+                    raise LookupError
+                out.append((c.lineno, c.end_lineno))
+            if isinstance(c, _DEF + (ast.Lambda,)):
+                for d in (getattr(c, "decorator_list", []) + c.args.defaults
+                          + [k for k in c.args.kw_defaults if k is not None]):
+                    walk(ast.Expression(body=d), in_func)
+                body = c.body if isinstance(c.body, list) else [c.body]
+                walk(ast.Module(body=body, type_ignores=[]) if isinstance(c.body, list)
+                     else ast.Expression(body=c.body), True)
+                continue
+            walk(c, in_func)
+    try:
+        walk(tree, False)
+    except LookupError:
+        return None
+    return out
+
+
+def import_scope_names(text):
+    """Names loaded while the module is imported: module level and class bodies (with decorators,
+    default values, bases), plus, transitively, the bodies of the module's own top-level functions
+    that import-time code refers to (a factory called from a class body runs at import)."""
+    tree = ast.parse(text)
+    funcs = {n.name: n for n in tree.body if isinstance(n, _DEF)}
+    out = set()
+
+    def loads(root, into, enter):
+        todo = list(root.body) if enter else [root]
+        while todo:
+            n = todo.pop()
+            if isinstance(n, _DEF):  # def statement: decorators and defaults run, the body does not
+                todo.extend(n.decorator_list)
+                todo.extend(n.args.defaults)
+                todo.extend(d for d in n.args.kw_defaults if d is not None)
+                continue
+            if isinstance(n, ast.Lambda):
+                todo.extend(n.args.defaults)
+                continue
+            if isinstance(n, ast.Name):
+                into.add(n.id)
+            elif isinstance(n, ast.Attribute):
+                into.add(n.attr)
+            todo.extend(ast.iter_child_nodes(n))
+
+    for n in tree.body:
+        loads(n, out, False)
+    done = set()
+    while True:
+        more = [f for f in funcs if f in out and f not in done]
+        if not more:
+            break
+        for f in more:
+            done.add(f)
+            loads(funcs[f], out, True)
+    return out
+
+
 # ---------------------------------------------------------------- import check
 
 _IMPORT_PROBE = r"""
@@ -655,7 +832,7 @@ class Finder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
         if is_pkg:
             module.__path__ = [origin.rsplit("/", 1)[0]]
         module.__file__ = origin
-        exec(compile(src, origin, "exec"), module.__dict__)
+        exec(compile(src.encode("utf-8", "surrogatepass"), origin, "exec"), module.__dict__)
 sys.path.insert(0, root)
 sys.meta_path.insert(0, Finder())
 failed = []
@@ -748,7 +925,7 @@ class Finder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
         if is_pkg:
             module.__path__ = [origin.rsplit("/", 1)[0]]
         module.__file__ = origin
-        exec(compile(src, origin, "exec"), module.__dict__)
+        exec(compile(src.encode("utf-8", "surrogatepass"), origin, "exec"), module.__dict__)
 class _Asked(importlib.abc.MetaPathFinder):
     def find_spec(self, name, path, target=None):
         _asked.add(name)
@@ -1076,13 +1253,121 @@ class Selector:
         self.untraced = {t["number"] for t in tests if t["id"] not in traced_ids}
         self.e1, self.e1_nums, self.e1_ids, self.e1_spent = None, set(), {}, 0.0
         if E1 and (APP / "e1map.json.gz").exists():
-            import e1_cutoff
-            self.e1 = e1_cutoff.Cutoff(APP / "e1map.json.gz")
-            self.e1_ids = {self.number[t]: t for t in self.e1.tests if t in self.number}
-            self.e1_nums = set(self.e1_ids)
+            try:
+                import e1_cutoff
+                self.e1 = e1_cutoff.Cutoff(APP / "e1map.json.gz")
+                self.e1_ids = {self.number[t]: t for t in self.e1.tests if t in self.number}
+                self.e1_nums = set(self.e1_ids)
+            except Exception:  # noqa: BLE001  E1 is optional: without it every test it would judge is kept
+                self.e1, self.e1_nums, self.e1_ids = None, set(), {}
         self.by_file = {}
         for t in tests:
             self.by_file.setdefault(t["file"], set()).add(t["number"])
+        self._texts, self._scope_names, self._names_memo = {}, None, {}
+
+    def text(self, path):
+        v = self._texts.get(path)
+        if v is None:
+            try:
+                v = (SRC / path).read_text(encoding="utf-8")
+            except (OSError, ValueError):
+                v = ""
+            self._texts[path] = v
+        return v
+
+    def import_names(self, path):
+        """Names a module loads while it is imported (import_scope_names), from the build-time
+        index when its digest matches the pinned text, else computed here (None: unparseable)."""
+        import hashlib
+        hit = self._names_memo.get(path, 0)
+        if hit != 0:
+            return hit
+        if self._scope_names is None:
+            try:
+                self._scope_names = json.loads((CACHE / "import_names.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                self._scope_names = {}
+        text = self.text(path)
+        e = self._scope_names.get(path)
+        digest = hashlib.sha1(text.encode("utf-8", "surrogatepass")).hexdigest()
+        if not (isinstance(e, list) and e[0] == digest):
+            try:
+                e = [digest, sorted(import_scope_names(text))]
+            except (SyntaxError, ValueError):
+                e = [digest, None]
+            self._scope_names[path] = e
+        v = self._names_memo[path] = None if e[1] is None else set(e[1])
+        return v
+
+    def name_readers(self, path, names):
+        """Guard: a changed module-level name is read by other modules (`from X import NAME`,
+        `X.NAME`). For every importer that mentions one of the names: a read inside a function
+        selects the tests that ran that line; a read at import scope (module or class body) makes
+        derived module state, so it selects every user of that importer; a test file: all its tests."""
+        if not names:
+            return set()
+        pat = re.compile(r"\b(?:" + "|".join(map(re.escape, sorted(names))) + r")\b")
+        out = set()
+        for f in self.import_closure(path) - {path}:
+            if not f.endswith(".py") or not pat.search(self.text(f)):
+                continue
+            if f in self.by_file:
+                out |= self.by_file[f]
+            try:
+                reads = name_reads(self.text(f), names)
+            except (SyntaxError, ValueError):
+                reads = None
+            if reads is None:
+                out |= self.file_tests(f) | self.class_users(f, "<module>")
+                continue
+            for lo, hi in reads:
+                out |= self.touching(f, lo, hi)
+        return out
+
+    def lazy_import_users(self, path, fname):
+        """Guard: function `fname` of `path` runs while a lazily imported module (one not imported
+        at collection) is imported inside some test. Its result is shared by every user of that
+        module, but the map credits its lines only to the first importer: users of each such module."""
+        out = set()
+        for f in {path, *self.importers.get(path, ())}:  # the module and its direct importers
+            if f.endswith(".py") and f not in self.collect:
+                n = self.import_names(f)
+                if n is None or fname in n:
+                    out |= self.file_tests(f) | self.class_users(f, "<module>")
+        return out
+
+    def package_tests(self, path):
+        """Every test file in the package (directory) of a tests/ helper or __init__ module."""
+        pre = path.rsplit("/", 1)[0] + "/"
+        out = set()
+        for f, nums in self.by_file.items():
+            if f.startswith(pre):
+                out |= nums
+        return out
+
+    def dir_openers(self, path):
+        """Guard: a new file in a directory that tests enumerate: the tests that opened the
+        directory (or an ancestor of it) or any file next to it."""
+        parent = path.rsplit("/", 1)[0] if "/" in path else ""
+        out = set()
+        for k, sid in self.opened.items():
+            kp = k.rsplit("/", 1)[0] if "/" in k else ""
+            if (k != path and kp == parent) or path.startswith(k.rstrip("/") + "/"):
+                out |= self.sets[sid]
+        return out
+
+    def dir_mentions(self, path):
+        """Guard: a non-Python file in a top-level directory that is not a Python package (build
+        and packaging trees such as sqlglotc/): the test files that refer to that directory."""
+        top = path.split("/", 1)[0]
+        if "/" not in path or top == "tests" or (SRC / top / "__init__.py").exists():
+            return set()
+        pat = re.compile(r"\b" + re.escape(top) + r"\b")
+        out = set()
+        for f, nums in self.by_file.items():
+            if pat.search(self.text(f)):
+                out |= nums
+        return out
 
     def touching(self, path, lo=None, hi=None):
         d = self.lines.get(path, {})
@@ -1172,7 +1457,9 @@ class Selector:
                         scope_changed[new] = apply_hunks("", f["hunks"])[0]
                     except ValueError:
                         pass
-                why.append(f"{new}: new file -> none")
+                sel = self.dir_openers(new) | (set() if new.endswith(".py") else self.dir_mentions(new))
+                chosen |= sel
+                why.append(f"{new}: new file -> directory openers {len(sel)}")
                 continue
             src = SRC / old
             if not src.exists():
@@ -1198,6 +1485,7 @@ class Selector:
                 sel = set()
                 if old in self.opened:
                     sel = set(self.sets[self.opened[old]])
+                sel |= self.dir_mentions(old)
                 chosen |= sel
                 why.append(f"{old}: data file -> openers {len(sel)}")
                 continue
@@ -1246,6 +1534,8 @@ class Selector:
                         # only ever ran at import time: its effect reaches the module's users
                         kind, qualname = "scope", "<module>"
                         sel |= self.touching(old)
+                if kind == "func" and "." not in qualname and not at_import:
+                    sel |= self.lazy_import_users(old, qualname)
                 if IMPORT_TIME_RULE and at_import:
                     kind, qualname = "scope", "<module>"
                 if kind == "scope":
@@ -1256,6 +1546,23 @@ class Selector:
                         scope_changed[old] = new_text
                     if old.startswith("tests/"):
                         sel |= self.by_file.get(old, set())
+            if any(r[0] == "scope" for r in regions):
+                try:
+                    names, added, effects = top_level_changes(old_text, new_text)
+                except (SyntaxError, ValueError):
+                    names, added, effects = None, None, True
+                helper = old.startswith("tests/") and not Path(old).name.startswith("test_")
+                if helper and effects:
+                    # a side effect at the top of a test helper / package __init__ (imported at
+                    # collection) changes the process every later test runs in
+                    why.append(f"{old}: module-level side effect in a test helper -> all")
+                    return set(self.all), why
+                if names is None:
+                    sel |= set(self.all)
+                else:
+                    if helper and names:
+                        sel |= self.package_tests(old)
+                    sel |= self.name_readers(old, names)
             chosen |= sel
             why.append(f"{old}: {len(regions)} changed code regions ({narrowed} statement-level) -> {len(sel)}")
         if scope_changed:
@@ -1270,6 +1577,11 @@ class Selector:
                 failed, detail = import_fails(SRC, scope_changed, probe)
             else:
                 failed, detail = True, "probe skipped: run deadline"
+            if failed and (not allow_probe or detail == "timeout" or detail.startswith("probe crashed")):
+                # no verdict (deadline, hang, crashed probe): an import that hangs or dies can take
+                # down whole workers, so assume the worst
+                why.append(f"import check gave no verdict ({detail.strip().splitlines()[-1:]}) -> all")
+                return set(self.all), why
             if failed:
                 broken = {p for p in scope_changed if (SRC / p).exists()}
                 for name in detail.split(", ") if allow_probe else ():
@@ -1337,14 +1649,29 @@ def precompute():
         rel = p.relative_to(SRC).as_posix()
         try:
             text = p.read_text(encoding="utf-8")
-            co = compile(text, rel, "exec", dont_inherit=True)
+            co = compile(_src_bytes(text), rel, "exec", dont_inherit=True)
         except Exception:
             continue
         f = _cache_file("code", rel)
         f.parent.mkdir(parents=True, exist_ok=True)
         f.write_bytes(hashlib.sha1(text.encode("utf-8", "surrogatepass")).hexdigest().encode() + marshal.dumps(co))
         n += 1
-    log(f"precompute: compact map, {n} compiled pinned files")
+    idx = {}
+    for p in sorted(SRC.rglob("*.py")):
+        rel = p.relative_to(SRC).as_posix()
+        try:
+            text = p.read_text(encoding="utf-8")
+            idx[rel] = [hashlib.sha1(text.encode("utf-8", "surrogatepass")).hexdigest(), sorted(import_scope_names(text))]
+        except Exception:
+            continue
+    CACHE.mkdir(parents=True, exist_ok=True)
+    (CACHE / "import_names.json").write_text(json.dumps(idx), encoding="utf-8")
+    log(f"precompute: compact map, {n} compiled pinned files, {len(idx)} import-scope name sets")
+
+
+
+
+
 
 
 
