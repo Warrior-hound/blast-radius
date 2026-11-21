@@ -814,7 +814,12 @@ def import_scope_names(text):
 
 # ---------------------------------------------------------------- import check
 
+# The probes import sqlglot the way the test run does: `unittest` is loaded first (every test
+# module imports it, and pytest's runner is in sys.modules too), because sqlglot reads that at import
+# time (expressions/core.py UNITTEST turns on strict argument checks that also run while dialect
+# modules build expressions at import). A probe without it can pass while the tests' imports fail.
 _IMPORT_PROBE = r"""
+import unittest  # the test environment (see above)
 import importlib.abc, importlib.util, json, sys
 _cfg = json.load(open(sys.argv[1], encoding="utf-8"))
 patched = _cfg["patched"]  # {module name: [source, is_pkg, origin]}
@@ -909,6 +914,7 @@ def _probe_all():
 # _IMPORT_PROBE unchanged and exits through normal interpreter shutdown (threads joined, atexit
 # run). Probes that patch a module that `import sqlglot` itself asks for run cold, as before.
 _PROBE_SERVER = r"""
+import unittest  # the test environment (see _IMPORT_PROBE)
 import importlib.abc, importlib.util, json, sys, os
 patched = {}
 root = sys.argv[1]

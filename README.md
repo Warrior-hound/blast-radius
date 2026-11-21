@@ -22,7 +22,7 @@ For each sqlglot patch, pick the tests that can catch it and split them over at 
    the selection instead of guessing. Further guards widen it for change kinds the map cannot see:
    sources are compiled from bytes (PEP 263 encoding cookies), changed module-level names select the
    tests of modules that read them, a new file selects the tests that opened its directory or siblings,
-   import-time functions of lazily imported modules select that module's users, non-Python files in a
+   import-time functions of lazily imported modules select that module's users, import probes load unittest first (as the test run does), non-Python files in a
    test-named directory select those tests, and a probe timeout, crash or deadline skip selects every test.
 7. **Packing:** longest test first onto the least-loaded worker, with the worker count chosen to minimize
    the busiest worker's time plus 2 s per worker.
