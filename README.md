@@ -11,6 +11,17 @@ For each sqlglot patch, pick the tests that can catch it and split them over at 
    for every test, the source lines it executed, the files it opened (fixtures), and the classes it
    called methods on. A changed function selects the tests that executed it. A changed class body or
    module-level statement also selects every test that used that class or module.
+   Before a changed function selects tests, the old and new function are compared instruction by instruction
+   (DejaVu-style): only the lines whose compiled code differs, plus lines whose control flow the edit can divert
+   (for example a deleted block header that re-parents its body), select the tests that executed them. Edits
+   that compile to identical instructions select nothing. This runs for same-frame edits too.
+   **Collect-time narrowing:** a function that ran while the test suite was collected is narrowed like any
+   other when none of its divergent statements ran at collection; if one did, collection is affected and the
+   function selects every test that uses its module (an import probe still runs).
+   **Persistent-state guard:** a changed function that writes state outliving the call (module or class
+   attributes, globals, `setattr`/`delattr`, `__class__`, mutating calls such as `append`/`update` on
+   module-level or class-level objects, writes through call results) is never narrowed, so every test that
+   executed it is selected.
 4. **Import check:** when import-time code changed, the patched modules are imported in a throwaway
    interpreter; a crash there selects every test that imports them.
 5. **Compile-stage cutoff for the TPC executor tests** (`e1_cutoff.py`, `e1map.json.gz`): when a changed
@@ -25,7 +36,10 @@ For each sqlglot patch, pick the tests that can catch it and split them over at 
    import-time functions of lazily imported modules select that module's users, import probes load unittest first (as the test run does), non-Python files in a
    test-named directory select those tests, and a probe timeout, crash or deadline skip selects every test, and a change to which names a module binds (or to a registry table naming modules) selects the tests that read those names, including registries built by scanning a module namespace.
 7. **Operator-swap witness:** when a changed file's only edits are swapped comparison or boolean operators at sites traced on the pinned suite, and no evaluation anywhere in the suite would have produced a different value, the file adds no line-coverage tests (all guards still apply).
-8. **Packing:** longest test first onto the least-loaded worker, with the worker count chosen to minimize
+8. **Build-time precomputed maps:** the Docker build runs `selector.py --precompute` and `e2_ns.py build`, which
+   write compact pickled copies of the maps, the pinned code objects and the namespace fingerprints into
+   `/app/cache`, so a run only loads them. Build-time work is not charged.
+9. **Packing:** longest test first onto the least-loaded worker, with the worker count chosen to minimize
    the busiest worker's time plus 2 s per worker.
 
 No table from patches or edit kinds to tests is used anywhere: the selection is computed from the patch

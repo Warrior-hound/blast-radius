@@ -15,6 +15,7 @@ Pipeline per commit (each stage only handles what the earlier, cheaper ones coul
 Logs go to stderr; stdout carries exactly one JSON line per commit.
 """
 import ast
+import gc
 import gzip
 import json
 import math
@@ -33,6 +34,9 @@ MAP = Path(os.environ.get("RWX_MAP", APP / "map.json.gz"))
 MAX_WORKERS = 8
 # Rule switches, for measuring each rule's effect on labeled sets (defaults are what ships).
 IMPORT_TIME_RULE = os.environ.get("RWX_IMPORT_TIME_RULE", "0") == "1"  # off: costs ~43 s on the sample, caught 0 misses so far
+# frame-changing edits narrowed to the statements whose instructions differ (DejaVu), and functions
+# that ran at collection narrowed when no divergent statement ran there
+FRAME_DIFF = os.environ.get("RWX_FRAME_DIFF", "1") == "1"
 E1 = os.environ.get("RWX_E1", "1") == "1"  # on by default; stage-boundary early cutoff for the TPC executor tests (e1_cutoff.py)
 WORKER_COST_MS = 2000
 PROBE_TIMEOUT_S = 10  # measured probes take <= 0.6 s
@@ -58,6 +62,24 @@ E2_TIMEOUT_S = 20
 E2_COST_MS = 1600  # measured CPU of one namespace diff (interpreter, import, fingerprint)
 E2_FP = Path(os.environ.get("RWX_E2_FP", APP / "cache" / "e2fp.pickle"))  # written at image build
 E2_CANON = E2_FP.with_suffix(".canon.json")
+
+
+# Parsed trees of the last few texts: one commit parses the same old/new text in several stages
+# (e2_expected, _FileInfo, top_level_changes, operator_swaps_in) and importers again across commits.
+# Every consumer only reads the tree (the two that blank a field restore it in try/finally), so a
+# shared tree gives the same results. Failures are not cached: they raise again, the same way.
+_PARSED = {}
+_PARSED_MAX = 8
+
+
+def _parse(text):
+    t = _PARSED.pop(text, None)
+    if t is None:
+        t = ast.parse(text)
+        if len(_PARSED) >= _PARSED_MAX:
+            del _PARSED[next(iter(_PARSED))]
+    _PARSED[text] = t
+    return t
 
 
 def _scope_bindings(body):
@@ -106,7 +128,7 @@ def e2_expected(path, old_text, new_text):
     binding the edit changes at module or class scope must appear as a changed location; other
     changed module / class statements need some change in that scope. None: cannot tell."""
     try:
-        to, tn = ast.parse(old_text), ast.parse(new_text)
+        to, tn = _parse(old_text), _parse(new_text)
     except (SyntaxError, ValueError):
         return None
     mod = path[:-3].replace("/", ".")
@@ -387,7 +409,7 @@ def _header_range(node):
 class _FileInfo:
     def __init__(self, text):
         self.lines = text.split("\n")
-        self.tree = ast.parse(text)
+        self.tree = _parse(text)
         self.funcs = {}
         self.strings = set()  # lines inside multi-line string literals
         # Same nodes as ast.walk would yield for what is collected here: a node that fits on one
@@ -507,14 +529,68 @@ def _same_frame(oco, nco):
 _CLS_LIKE = ("cls", "mcs", "klass", "metacls")
 
 
-def _writes_persistent(fn, co):
-    """True when the function body (not nested defs or lambdas) stores into state that outlives the
-    call: a `global`/`nonlocal` statement, or a subscript/attribute store or delete whose base is a
-    module-level name or the class argument (`CACHE[k] = v`, `mod.X = v`, `cls.x = v`). Such a store
-    can carry an edited statement's effect to tests that never execute that statement."""
+_MUTATORS = {"append", "extend", "pop", "setdefault", "update", "insert", "remove", "clear", "add", "discard",
+             "popitem", "appendleft", "extendleft", "sort", "reverse", "__setitem__", "__delitem__", "__iadd__",
+             "__ior__"}
+_SETATTR = {"setattr", "delattr", "__setattr__", "__delattr__"}
+
+
+def _class_attrs(fi):
+    """Names bound directly in some class body of the file (class-level attributes)."""
+    out = getattr(fi, "_class_attrs", None)
+    if out is None:
+        out = set()
+        for c in ast.walk(fi.tree):
+            if not isinstance(c, ast.ClassDef):
+                continue
+            for st in c.body:
+                tg = st.targets if isinstance(st, ast.Assign) else [st.target] if isinstance(
+                    st, (ast.AugAssign, ast.AnnAssign)) else ()
+                stack = list(tg)
+                while stack:
+                    t = stack.pop()
+                    if isinstance(t, (ast.Tuple, ast.List)):
+                        stack.extend(t.elts)
+                    elif isinstance(t, ast.Starred):
+                        stack.append(t.value)
+                    elif isinstance(t, ast.Name):
+                        out.add(t.id)
+        fi._class_attrs = out
+    return out
+
+
+def _writes_persistent(fn, co, fi=None):
+    """True when the function body (not nested defs or lambdas) writes into state that outlives the
+    call: a `global`/`nonlocal` statement; a subscript/attribute store or delete, or a mutating method
+    call (`append`, `update`, `setdefault`, ...), on an object reached from a module-level name, the
+    class argument, a call result (`globals()[k]`, `type(self).x`), `<x>.__class__`, or a class-level
+    attribute through the first parameter (`self.REGISTRY[k] = v`); or a setattr/delattr call. Such a
+    write can carry an edited statement's effect to tests that never execute that statement."""
     local = set(co.co_varnames) | set(co.co_cellvars) | set(co.co_freevars)
     params = fn.args.posonlyargs + fn.args.args
-    cls_arg = params[0].arg if params and params[0].arg in _CLS_LIKE else None
+    first = params[0].arg if params else None
+    cls_arg = first if first in _CLS_LIKE else None
+    cattrs = _class_attrs(fi) if fi is not None else None
+
+    def shared(obj):
+        # obj is the object written into; True when it can outlive the call
+        near = None
+        b = obj
+        while isinstance(b, (ast.Subscript, ast.Attribute)):
+            if isinstance(b, ast.Attribute):
+                if b.attr == "__class__":
+                    return True
+                near = b.attr
+            b = b.value
+        if isinstance(b, ast.Call):
+            return True
+        if isinstance(b, ast.Name):
+            if b.id == cls_arg or b.id not in local:
+                return True
+            if b.id == first and near is not None and (cattrs is None or near in cattrs):
+                return True
+        return False
+
     todo = list(fn.body)
     while todo:
         n = todo.pop()
@@ -522,6 +598,12 @@ def _writes_persistent(fn, co):
             return True
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
             continue
+        if isinstance(n, ast.Call):
+            f = n.func
+            if (isinstance(f, ast.Name) and f.id in _SETATTR) or (isinstance(f, ast.Attribute) and f.attr in _SETATTR):
+                return True
+            if isinstance(f, ast.Attribute) and f.attr in _MUTATORS and shared(f.value):
+                return True
         tgts = ()
         if isinstance(n, ast.Assign):
             tgts = n.targets
@@ -540,12 +622,8 @@ def _writes_persistent(fn, co):
                 stack.extend(t.elts)
             elif isinstance(t, ast.Starred):
                 stack.append(t.value)
-            elif isinstance(t, (ast.Subscript, ast.Attribute)):
-                b = t.value
-                while isinstance(b, (ast.Subscript, ast.Attribute)):
-                    b = b.value
-                if isinstance(b, ast.Name) and (b.id == cls_arg or b.id not in local):
-                    return True
+            elif isinstance(t, (ast.Subscript, ast.Attribute)) and shared(t.value):
+                return True
         todo.extend(ast.iter_child_nodes(n))
     return False
 
@@ -554,15 +632,141 @@ def _code_lines(co):
     return {ln for _, _, ln in co.co_lines() if ln is not None}
 
 
+# ---------------------------------------------------------------- frame-changing edits (DejaVu)
+#
+# An edit that changes the frame (a name becomes local or global, a name is no longer looked up)
+# can change the meaning of statements whose text did not change. Rothermel & Harrold's safe RTS:
+# execution is identical to the old run until the first instruction whose semantics differ, so the
+# tests that can change are those that executed a statement whose compiled instructions differ.
+# Each kept line's instructions are compared with names resolved (LOAD_FAST x vs LOAD_GLOBAL x
+# differ; local slot and name-table indexes do not matter), constants by value, and control flow by
+# where it goes: jump targets, fall-through successors and exception handlers are compared as the
+# (old line, index) of the instruction they reach. Anything not attributable to a line, or a frame
+# difference outside locals and looked-up names, falls back to the whole function.
+
+_NO_FALLTHROUGH = {"RETURN_VALUE", "RETURN_CONST", "RAISE_VARARGS", "RERAISE", "JUMP_FORWARD", "JUMP_BACKWARD",
+                   "JUMP_BACKWARD_NO_INTERRUPT", "JUMP"}
+_SKIP_OPS = {"NOP", "EXTENDED_ARG", "CACHE"}
+# names that expose the frame itself: the set of locals is then observable
+_FRAME_NAMES = {"locals", "vars", "exec", "eval", "_getframe", "currentframe", "f_locals", "f_back", "dir", "globals"}
+
+
+def _relaxable_frame(oco, nco):
+    """Frame differences the per-line comparison can account for: only the locals and the names
+    looked up. Signature, parameter names, cells, free variables and flags must be the same."""
+    if not (oco.co_flags == nco.co_flags and oco.co_argcount == nco.co_argcount
+            and oco.co_posonlyargcount == nco.co_posonlyargcount and oco.co_kwonlyargcount == nco.co_kwonlyargcount
+            and oco.co_cellvars == nco.co_cellvars and oco.co_freevars == nco.co_freevars):
+        return False
+    n = oco.co_argcount + oco.co_kwonlyargcount + bool(oco.co_flags & 0x04) + bool(oco.co_flags & 0x08)
+    if oco.co_varnames[:n] != nco.co_varnames[:n]:
+        return False
+    return not (_FRAME_NAMES & (set(oco.co_names) | set(nco.co_names)))
+
+
+def _instructions(co, line_key):
+    """({identity: normalized instruction}, {identity: predecessor identities}) for co's own
+    instructions. An identity is (line key, index among that line's instructions); line_key maps a
+    source line (or None) to the key that identifies it across old and new."""
+    import dis
+    every = list(dis.get_instructions(co))
+    ins = [i for i in every if i.opname not in _SKIP_OPS]
+    ident, count = {}, {}
+    for i in ins:
+        k = line_key(i.positions.lineno if i.positions else None)
+        n = count.get(k, 0)
+        count[k] = n + 1
+        ident[i.offset] = (k, n)
+    resolved, nxt = {}, ("<end>",)  # an offset on a skipped instruction reaches the next kept one
+    for i in reversed(every):
+        if i.offset in ident:
+            nxt = ident[i.offset]
+        resolved[i.offset] = nxt
+
+    def where(off):
+        return resolved.get(off, ("<off>",))
+
+    if not hasattr(dis, "_parse_exception_table"):
+        raise ValueError("exception table not readable")
+    table = dis._parse_exception_table(co)
+    hasjump = set(getattr(dis, "hasjump", ())) | set(dis.hasjrel) | set(dis.hasjabs)
+    hasconst, names = set(dis.hasconst), set(dis.hasname) | set(dis.haslocal) | set(dis.hasfree)
+    elems, preds = {}, {}
+    for idx, i in enumerate(ins):
+        me, outs, tgt = ident[i.offset], [], None
+        if i.opcode in hasjump:
+            t = getattr(i, "jump_target", None)
+            tgt = where(i.argval if t is None else t)
+            arg = "->"
+            outs.append(tgt)
+        elif i.opcode in hasconst:
+            arg = _canon(i.argval)
+        elif i.opcode in names:
+            arg = i.argrepr  # the resolved name, plus flags such as "NULL|self +"
+        else:
+            arg = (i.arg, i.argrepr)
+        h = None
+        for e in table:
+            if e.start <= i.offset < e.end:
+                h = (where(e.target), e.depth, e.lasti)
+                outs.append(h[0])
+                break
+        if i.opname in _NO_FALLTHROUGH:
+            succ = None
+        else:
+            succ = ident[ins[idx + 1].offset] if idx + 1 < len(ins) else ("<end>",)
+            outs.append(succ)
+        elems[me] = (i.opname, arg, tgt, h, succ)
+        for o in outs:
+            preds.setdefault(o, set()).add(me)
+    return elems, preds
+
+
+def _divergent_lines(oco, nco, new2old):
+    """Old lines whose instructions differ from the new code's, by instruction identity. The first
+    instruction a test executes differently is one the old code has (the instruction executed
+    before it is the same in both, so it reaches the same identity), so only old identities count.
+    An instruction without a line number is charged to the lines that can reach it in the old code.
+    Lines the edit removed are included (the textual diff targets them too)."""
+    old, opred = _instructions(oco, lambda ln: ln)
+    new, _ = _instructions(nco, lambda ln: ln if ln is None else new2old.get(ln, ("new", ln)))
+    out, todo, seen = set(), [], set()
+    for k, v in old.items():
+        w = new.get(k)
+        if w == v:
+            continue
+        if w is None or w[:2] != v[:2] or (v[3] is None) != (w[3] is None) or (v[3] and v[3][1:] != w[3][1:]):
+            todo.append(k)  # the instruction itself does something else
+            continue
+        # same operation, different destination: a test diverges only when it goes there, and in
+        # the old run it then executed the old destination (or, without a line, this instruction)
+        for a, b in ((v[2], w[2]), (v[3] and v[3][0], w[3] and w[3][0]), (v[4], w[4])):
+            if a != b:
+                todo.append(a if a is not None and isinstance(a[0], int) else k)
+    while todo:
+        k = todo.pop()
+        if k in seen:
+            continue
+        seen.add(k)
+        if k[0] is None:
+            if not opred.get(k):
+                return None  # unreachable from any line: cannot attribute it
+            todo.extend(opred[k])
+        elif isinstance(k[0], int):
+            out.add(k[0])
+    return out
+
+
 def statement_ranges(oco, nco, old_fi, new_fi, diff):
     """Old-file line ranges whose executing tests cover every test the edit to this function can
     affect, or None when the edit cannot be localized (the caller then uses the whole function)."""
-    if not _same_frame(oco, nco):
+    same = _same_frame(oco, nco)
+    if not same and not (FRAME_DIFF and _relaxable_frame(oco, nco)):
         return None
     ofn, nfn = old_fi.func(oco), new_fi.func(nco)
     if ofn is None or nfn is None:
         return None
-    if _writes_persistent(ofn, oco) or _writes_persistent(nfn, nco):
+    if _writes_persistent(ofn, oco, old_fi) or _writes_persistent(nfn, nco, new_fi):
         return None
     removed, inserted, new2old = diff
     ost, nst = _stmts(ofn), _stmts(nfn)
@@ -643,6 +847,21 @@ def statement_ranges(oco, nco, old_fi, new_fi, diff):
         t = old_twin(s)  # an edited statement: the tests that ran its old version
         if not (target_old(t) if t is not None else position(e)):
             return None
+    if FRAME_DIFF:
+        # the frame changed: kept statements whose instructions now mean something else
+        div = _divergent_lines(oco, nco, new2old)
+        if div is None:
+            return None
+        for ln in sorted(div):
+            e = _innermost(ost, ln)
+            if e is None or doc(ofn, e[0]):
+                return None
+            s = e[0]
+            if _in_nested_body(s, ln):
+                return None  # the parent's instructions never sit in a nested body
+            h = _header_range(s)
+            if h is None or not h[0] <= ln <= h[1] or not target_old(s):
+                return None
     return targets or None
 
 
@@ -837,8 +1056,8 @@ def _top_level(tree):
 
 def top_level_changes(old_text, new_text):
     """(names whose top-level binding changed or disappeared, names added, effects changed?)."""
-    on, oe = _top_level(ast.parse(old_text))
-    nn, ne = _top_level(ast.parse(new_text))
+    on, oe = _top_level(_parse(old_text))
+    nn, ne = _top_level(_parse(new_text))
     changed = {k for k, v in on.items() if sorted(v) != sorted(nn.get(k, []))}
     added = set(nn) - set(on)
     return changed, added, sorted(oe) != sorted(ne)
@@ -848,7 +1067,7 @@ def name_reads(text, names):
     """Line ranges inside function bodies where the module loads one of `names` (directly, via an
     `as` alias of `from ... import NAME`, or as an attribute `mod.NAME`); None when any load happens
     at import scope (module level, class bodies, decorators, defaults)."""
-    tree = ast.parse(text)
+    tree = _parse(text)
     want = set(names)
     for n in ast.walk(tree):
         if isinstance(n, ast.ImportFrom):
@@ -886,7 +1105,7 @@ def import_scope_names(text):
     """Names loaded while the module is imported: module level and class bodies (with decorators,
     default values, bases), plus, transitively, the bodies of the module's own top-level functions
     that import-time code refers to (a factory called from a class body runs at import)."""
-    tree = ast.parse(text)
+    tree = _parse(text)
     funcs = {n.name: n for n in tree.body if isinstance(n, _DEF)}
     out = set()
 
@@ -1279,6 +1498,28 @@ def build_compact_map(map_path, out_path):
     Path(out_path).write_bytes(_map_digest(raw) + marshal.dumps(c))
 
 
+def _load_map_json(path):
+    """The JSON content of a gzip map file, from the build-time pickle of it (`--precompute`) when
+    that was made from exactly this file (same bytes), else decoded here."""
+    import pickle
+    raw = Path(path).read_bytes()
+    try:
+        cached = (CACHE / (Path(path).name + ".pickle")).read_bytes()
+        if cached[:40] == _map_digest(raw):
+            return pickle.loads(cached[40:])
+    except Exception:  # noqa: BLE001  no usable cache: decode the map itself
+        pass
+    return json.loads(gzip.decompress(raw).decode("utf-8"))
+
+
+def build_map_pickle(path):
+    import pickle
+    raw = Path(path).read_bytes()
+    m = json.loads(gzip.decompress(raw).decode("utf-8"))
+    CACHE.mkdir(parents=True, exist_ok=True)
+    (CACHE / (Path(path).name + ".pickle")).write_bytes(_map_digest(raw) + pickle.dumps(m, protocol=pickle.HIGHEST_PROTOCOL))
+
+
 def _load_compact_map(map_path):
     """The compact copy when it was built from exactly this map file, else None."""
     import marshal
@@ -1390,7 +1631,7 @@ def operator_swaps_in(old_text, new_text, line_off=0):
     whole boolean operations, return [(kind, "l:c:el:ec" of the old node, new op index)]; else None.
     kind 'c': Compare (op index into _R1_OPS); 'b': BoolOp (0 and, 1 or)."""
     try:
-        o, n = ast.parse(old_text), ast.parse(new_text)
+        o, n = _parse(old_text), _parse(new_text)
     except (SyntaxError, ValueError):
         return "err"
     on, nn = list(ast.walk(o)), list(ast.walk(n))
@@ -1452,8 +1693,7 @@ class WitnessMap:
         self.loaded = True
         self.sets, self.sites = [], {}  # a failed read leaves an empty map: every site is unknown -> fallback
         number = self.number
-        with gzip.open(self.path, "rt", encoding="utf-8") as fh:
-            m = json.load(fh)
+        m = _load_map_json(self.path)
         idx = [number.get(t) for t in m["tests"]]
         self.sets = [frozenset(idx[i] for i in s if idx[i] is not None) for s in m["sets"]]
         self.sites = m["sites"]
@@ -1509,7 +1749,7 @@ class Selector:
         if E1 and (APP / "e1map.json.gz").exists():
             try:
                 import e1_cutoff
-                self.e1 = e1_cutoff.Cutoff(APP / "e1map.json.gz")
+                self.e1 = e1_cutoff.Cutoff(APP / "e1map.json.gz", _load_map_json(APP / "e1map.json.gz"))
                 self.e1_ids = {self.number[t]: t for t in self.e1.tests if t in self.number}
                 self.e1_nums = set(self.e1_ids)
             except Exception:  # noqa: BLE001  E1 is optional: without it every test it would judge is kept
@@ -1530,8 +1770,7 @@ class Selector:
     def _e2_load(self):
         if not (E2_MAP.exists() and E2_FP.exists() and E2_CANON.exists()):
             return None
-        with gzip.open(E2_MAP, "rt", encoding="utf-8") as fh:
-            m = json.load(fh)
+        m = _load_map_json(E2_MAP)
         if set(m["tests"]) != set(self.number) or m["missing"]:
             log("E2 map does not cover this suite: off")
             return None
@@ -1974,7 +2213,14 @@ class Selector:
             e2_ok = E2 and old.startswith("sqlglot/") and self.e2 is not None
             e2_prune = e2_ok and E2_PRUNE
             for kind, ranges, qualname, (lo, hi), own in regions:
-                at_import = kind == "func" and bool(own & col)
+                ran_at_import = kind == "func" and bool(own & col)
+                at_import = ran_at_import
+                if at_import and FRAME_DIFF and ranges != [(lo, hi)]:
+                    # collection ran this function but none of its divergent statements: collection
+                    # is unchanged, so the function narrows like any other
+                    at_import = any(a <= ln <= b for ln in col for a, b in ranges)
+                    if not at_import and importable(old):
+                        scope_changed[old] = new_text  # keep the import probe all the same
                 if at_import or ranges == [(lo, hi)]:
                     # a function that ran at import time shares its results with every user of the
                     # module: no statement narrowing for it
@@ -2158,6 +2404,11 @@ def precompute():
         build_compact_map(MAP, CACHE / "map.bin")
     except Exception as e:
         log(f"compact map not built ({type(e).__name__}: {e}): the gzip JSON map will be used")
+    for p in (APP / "e1map.json.gz", E2_MAP, R1_MAP):  # decoded-map pickles (checked on use)
+        try:
+            build_map_pickle(p)
+        except Exception as e:  # noqa: BLE001
+            log(f"map pickle for {p.name} not built ({type(e).__name__}: {e})")
     n = 0
     for p in sorted(SRC.rglob("*.py")):
         rel = p.relative_to(SRC).as_posix()
@@ -2189,6 +2440,17 @@ def precompute():
 
 
 
+GC_VALVE_MB = 1500
+
+
+def _maxrss_mb():
+    try:
+        import resource
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    except Exception:  # no resource module: keep the collector on
+        return float("inf")
+
+
 def main():
     if sys.argv[1:] == ["--baseline"]:  # image build step
         base = sorted(_probe_all())
@@ -2199,6 +2461,10 @@ def main():
         precompute()
         return
     t0 = time.monotonic()
+    # CPU: the cyclic collector rescans the loaded maps and every parsed tree over and over (~1/4 of
+    # this process's CPU on s1); nothing here depends on when cycles are freed. Memory stays well
+    # inside the limit (s1: 0.3 -> 0.55 GB); past GC_VALVE_MB the collector is switched back on.
+    gc.disable()
     tests = json.loads((DATA / "tests.json").read_text(encoding="utf-8"))["tests"]
     patches = sorted((DATA / "commits").glob("*.patch"))
     out_lock, done = threading.Lock(), set()
@@ -2239,6 +2505,9 @@ def main():
             sys.stdout.flush()
             done.add(patch.stem)
         log(f"{patch.stem}: {len(chosen)} tests, {len(workers)} workers | " + "; ".join(why))
+        if not gc.isenabled() and _maxrss_mb() > GC_VALVE_MB:
+            gc.enable()
+            gc.collect()
     timer.cancel()
     sys.stdout.flush()
     _close_probe_server()

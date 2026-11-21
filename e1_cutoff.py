@@ -367,9 +367,10 @@ def recompute(src_root, patched_files, work, timeout=CHILD_TIMEOUT_S, expect=Non
 # ------------------------------------------------------------------ the runtime rule
 
 class Cutoff:
-    def __init__(self, path):
-        with gzip.open(path, "rt", encoding="utf-8") as fh:
-            m = json.load(fh)
+    def __init__(self, path, m=None):
+        if m is None:  # m: the map's decoded JSON when the caller already has it
+            with gzip.open(path, "rt", encoding="utf-8") as fh:
+                m = json.load(fh)
         self.tests = {}
         for tid, d in m["tests"].items():
             self.tests[tid] = {
