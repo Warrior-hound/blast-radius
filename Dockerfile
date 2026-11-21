@@ -8,5 +8,5 @@ t.extractall('/tmp/x', filter='data')" \
  && mv /tmp/x/sqlglot-eb11aec4be8cb2122afe713a4816662c3f0fb2fa /app-sqlglot \
  && mkdir -p /app && mv /app-sqlglot /app/sqlglot && rm -rf /tmp/x
 COPY selector.py map.json.gz /app/
-RUN python -c "import compileall,sys; sys.exit(not compileall.compile_file('/app/selector.py', quiet=1))"
+RUN python -c "import compileall,sys; sys.exit(not compileall.compile_file('/app/selector.py', quiet=1))"  && python /app/selector.py --baseline
 CMD ["python", "/app/selector.py"]
