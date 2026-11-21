@@ -1,17 +1,17 @@
-"""E1: stage-boundary early cutoff for sqlglot's TPC executor tests.
 
-test_execute_tpcds / test_execute_tpch / test_optimized_tpch consume sqlglot in two phases per query:
-  C (compile): parse_one -> pickle round trip -> find_tables -> ensure_schema -> optimize -> Plan,
-               plus transpile(write="duckdb") for the reference result,
-  E (execute): everything else (Table loading, ensure_tables, PythonExecutor, generated Python).
-Only the C outputs cross into E: the Plan DAG, the table names, schema.supported_table_args and the
-duckdb strings. If every changed statement that brought such a test in ran only in C (per the offline
-phase map), and the C outputs recomputed with the patched sources equal the pinned ones, E runs the
-same code on the same inputs, so the test's outcome cannot change (early cutoff, by determinism).
 
-The phase map and pinned fingerprints are built offline by solution/rwx/lab/e1_lab.py.
-Anything unexpected (missing map, child error, timeout, mismatch) keeps the test.
-"""
+
+
+
+
+
+
+
+
+
+
+
+
 import gzip
 import hashlib
 import json
@@ -26,8 +26,8 @@ _SCALARS = (type(None), bool, int, float, complex, str, bytes)
 
 
 def _fields(o):
-    """(name, value) pairs of an instance, read from slots and __dict__ (no methods called).
-    Expression._hash is skipped: it caches a hash-seed dependent value."""
+
+
     t = type(o)
     out = []
     for c in t.__mro__:
@@ -54,7 +54,7 @@ _UNSET = _Mark("<unset>")
 
 
 def _atom(o):
-    """Token for a leaf value, or None for a container/instance."""
+
     import enum
     import types as T
     t = type(o)
@@ -72,7 +72,7 @@ def _atom(o):
 
 
 def _children(o, t):
-    """(open token, children) of a container/instance."""
+
     if t in (list, tuple):
         return f"{t.__name__[0]}[{len(o)}", list(o)
     if isinstance(o, dict):
@@ -103,8 +103,8 @@ def _shallow(o):
 
 
 def _order_key(o, cache, rounds=3):
-    """History-independent ordering key for a set member: its base key refined by the keys of the
-    members of its own set-valued fields (a few rounds of Weisfeiler-Lehman style refinement)."""
+
+
     k = cache.get((id(o), rounds))
     if k is not None:
         return k
@@ -118,8 +118,8 @@ def _order_key(o, cache, rounds=3):
 
 
 def _base_key(o, cache):
-    """A dump of what o reaches without following `parent` links or entering nested sets (those
-    contribute their members' shallow keys)."""
+
+
     i = id(o)
     k = cache.get(i)
     if k is not None:
@@ -152,7 +152,7 @@ def _base_key(o, cache):
 
 
 def _sorted_set(o, keys):
-    """Members ordered by their shallow key; members whose shallow keys collide by the full key."""
+
     groups = {}
     for y in o:
         groups.setdefault(_shallow(y), []).append(y)
@@ -167,7 +167,7 @@ _TYPE_INFO = {}
 
 
 def _type_info(t):
-    """(kind, header, slot names) per type, cached: kinds 0 atom, 1 list/tuple, 2 dict, 3 set, 4 object."""
+
     info = _TYPE_INFO.get(t)
     if info is None:
         import enum
@@ -194,12 +194,12 @@ def _type_info(t):
 
 
 def canon(root):
-    """Deterministic dump of the object graph reachable from root, read directly from instance
-    slots/__dict__ (never through sqlglot's own methods, which may be the patched code). Shared
-    objects and cycles become back-references, so identity structure (e.g. parent links) is kept.
-    Set members are visited in an order that depends only on the graph, not on hash seeds.
-    Prefix encoding: every container token carries its arity, so no closing tokens are needed.
-    Expression._hash is skipped: it caches a hash-seed dependent value."""
+
+
+
+
+
+
     out, memo, keep, keys = [], {}, [], {}
     push_out = out.append
     stack = [root]
@@ -255,7 +255,7 @@ def digest(parts):
     return h.hexdigest()[:32]
 
 
-# ------------------------------------------------------------------ the C-phase computation
+
 
 FIXTURE = {"tpcds": ("optimizer/tpc-ds/tpc-ds.sql", "TPCDS_SCHEMA"),
            "tpch": ("optimizer/tpc-h/tpc-h.sql", "TPCH_SCHEMA"),
@@ -263,7 +263,7 @@ FIXTURE = {"tpcds": ("optimizer/tpc-ds/tpc-ds.sql", "TPCDS_SCHEMA"),
 
 
 def boundary(kind, sql, meta, optimized, schema_dict):
-    """The values the test's E phase (or assertion) receives from sqlglot for one query."""
+
     import pickle
     from sqlglot import find_tables, parse_one, transpile
     from sqlglot.optimizer import optimize
@@ -275,8 +275,8 @@ def boundary(kind, sql, meta, optimized, schema_dict):
             parts.append("D" + transpile(sql, write="duckdb")[0])
             parts.append("D" + transpile(optimized, write="duckdb")[0])
             return digest(parts)
-        # what the test's parent process does with every query; only failures are observable
-        # for the ones it does not execute, since mp_execute then returns None
+
+
         e = pickle.loads(pickle.dumps(parse_one(sql)))
         parts.append("parsed")
         if meta.get("execute"):
@@ -286,7 +286,7 @@ def boundary(kind, sql, meta, optimized, schema_dict):
             parts += canon(plan)
             parts += canon(schema.supported_table_args)
             parts.append("D" + transpile(sql, write="duckdb")[0])
-    except Exception as ex:  # noqa: BLE001  (the exception type is part of the boundary)
+    except Exception as ex:
         parts.append(f"EXC {type(ex).__module__}.{type(ex).__qualname__}")
     return digest(parts)
 
@@ -299,11 +299,11 @@ def load_queries(kind):
     return qs, schema
 
 
-_CHILD = r"""
+
+
+_E1_SETUP = r"""
 import importlib, importlib.abc, importlib.util, json, sys
-cfg = json.load(open(sys.argv[1], encoding="utf-8"))
-root, app = sys.argv[2], sys.argv[3]
-patched = cfg["patched"]
+patched = {}
 class Finder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
     def find_spec(self, name, path, target=None):
         if name in patched:
@@ -317,22 +317,217 @@ class Finder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
             module.__path__ = [origin.rsplit("/", 1)[0]]
         module.__file__ = origin
         exec(compile(src, origin, "exec"), module.__dict__)
+root, app = sys.argv[2], sys.argv[3]
 sys.setrecursionlimit(900)  # below the real tests' default 1000 (pytest adds frames): deeper recursion must differ -> keep
 sys.path.insert(0, root)
 sys.meta_path.insert(0, Finder())
 sys.path.insert(0, app)
 import e1_cutoff as E
+"""
+
+_E1_WORK = r"""
+cfg = json.load(open(sys.argv[1], encoding="utf-8"))
+patched.update(cfg["patched"])
+fx = cfg.get("fixtures") or {}
 out = {}
-for kind, idx in cfg["work"].items():
+if fx:
+    # patched fixture texts, served to tests.helpers' own loader (it opens them by path)
+    import builtins, io, os.path
+    from tests import helpers as _h
+    _paths = {os.path.normpath(os.path.join(_h.FIXTURES_DIR, f)): t for f, t in fx.items()}
+    def _open(file, *a, **k):
+        t = _paths.get(os.path.normpath(str(file)))
+        return io.StringIO(t) if t is not None else builtins.open(file, *a, **k)
+    _h.open = _open
+    def _pairs(f, patched_fx):
+        saved = _h.open
+        _h.open = _open if patched_fx else builtins.open
+        try:
+            return list(_h.load_sql_fixture_pairs(f))
+        finally:
+            _h.open = saved
+    # the test class loads every fixture at class set-up: each patched one must still load, and the
+    # SQL text it shares with the other fixtures (the class's result cache is keyed by it) must not change
+    allf = sorted({v[0] for v in E.FIXTURE.values()})
+    chk = {}
+    for f in fx:
+        try:
+            new = {q[1] for q in _pairs(f, True)}
+            old = {q[1] for q in _pairs(f, False)}
+            others = set()
+            for g in allf:
+                if g != f:
+                    others |= {q[1] for q in _pairs(g, True)}
+            chk[f] = (new & others) == (old & others)
+        except Exception:
+            chk[f] = False
+    out["_fixtures"] = chk
+for kind, spec in cfg["work"].items():
     qs, schema = E.load_queries(kind)
     exp = cfg.get("expect", {}).get(kind)
-    out[kind] = {}
-    for i in idx:
+    out[kind] = {"_n": len(qs)}
+    idx = set(range(len(qs))) if spec["idx"] == "all" else set(spec["idx"])
+    if spec.get("changed"):
+        # queries whose fixture entry changed (same position, other text); a count change keeps the test
+        old = _pairs(E.FIXTURE[kind][0], False)
+        if len(old) != len(qs):
+            idx = set(range(len(qs)))
+        else:
+            idx |= {i for i in range(len(qs)) if tuple(old[i]) != tuple(qs[i])}
+    out[kind]["_idx"] = sorted(idx)
+    for i in sorted(idx):
+        if i >= len(qs):
+            out[kind]["_n"] = -1
+            break
         d = out[kind][str(i)] = E.boundary(kind, qs[i][1], qs[i][0], qs[i][2], schema)
-        if exp is not None and d != exp[i]:
+        if exp is not None and (i >= len(exp) or d != exp[i]):
             break  # one difference settles it: keep the test
 print(json.dumps(out))
 """
+
+_CHILD = _E1_SETUP + _E1_WORK
+
+
+
+
+
+
+
+_E1_SERVER = _E1_SETUP + r"""
+import os
+class _Asked(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path, target=None):
+        _asked.add(name)
+        return None
+_asked = set()
+_rec = _Asked()
+sys.meta_path.insert(0, _rec)
+_ok = True
+try:
+    import sqlglot
+except BaseException:
+    _ok = False
+sys.meta_path.remove(_rec)
+_asked |= set(sys.modules)
+sys.stdout.flush()
+sys.stderr.flush()
+os.write(1, (json.dumps({"ok": _ok, "asked": sorted(_asked)}) + "\n").encode())
+_inp = sys.stdin.buffer
+while _ok:
+    _line = _inp.readline()
+    if not _line:
+        break
+    _req = json.loads(_line)
+    _pid = os.fork()
+    if _pid == 0:
+        import gc
+        gc.freeze()  # CPU only: the parent's objects are never rescanned; young garbage still collected
+        gc.set_threshold(20000, 50, 1000)
+        for _p, _fl, _to in ((_req["out"], os.O_WRONLY | os.O_TRUNC, 1), (os.devnull, os.O_WRONLY, 2),
+                             (os.devnull, os.O_RDONLY, 0)):
+            _fd = os.open(_p, _fl)
+            os.dup2(_fd, _to)
+            os.close(_fd)
+        try:
+            sys.argv = ["-c", _req["cfg"], root, app]
+            exec(compile(_E1_WORK_SRC, "<string>", "exec"), globals())
+        finally:
+            try:
+                sys.stdout.flush()
+            finally:
+                os._exit(0)
+    os.write(1, (json.dumps({"pid": _pid}) + "\n").encode())
+    os.waitpid(_pid, 0)
+    os.write(1, b'{"done": 1}\n')
+"""
+
+
+class _Server:
+    def __init__(self):
+        self.proc, self.asked, self.dead, self.buf = None, None, False, b""
+
+    def _start(self, src_root, env):
+        self.root = str(src_root)
+        self.proc = subprocess.Popen([sys.executable, "-I", "-S", "-c", _E1_SERVER.replace(
+            "_E1_WORK_SRC", repr(_E1_WORK)), "", self.root, str(Path(__file__).resolve().parent)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)
+        hello = self._line(CHILD_TIMEOUT_S)
+        if not hello or not hello.get("ok"):
+            raise RuntimeError("E1 server unavailable")
+        self.asked = set(hello["asked"])
+
+    def _line(self, timeout):
+        import select
+        import time
+        deadline = time.monotonic() + timeout
+        fd = self.proc.stdout.fileno()
+        while b"\n" not in self.buf:
+            left = deadline - time.monotonic()
+            if left <= 0 or not select.select([fd], [], [], left)[0]:
+                return None
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                raise RuntimeError("E1 server exited")
+            self.buf += chunk
+        line, self.buf = self.buf.split(b"\n", 1)
+        return json.loads(line)
+
+    def run(self, src_root, cfg, names, timeout, env):
+
+        import tempfile
+        import time
+        if self.dead or not hasattr(os, "fork") or os.environ.get("RWX_E1_FORK", "1") != "1":
+            return None
+        try:
+            if self.proc is None:
+                self._start(src_root, env)
+            if str(src_root) != self.root or names & self.asked:
+                return None
+            fo, out = tempfile.mkstemp(suffix=".out")
+            os.close(fo)
+            try:
+                t0 = time.monotonic()
+                self.proc.stdin.write((json.dumps({"cfg": cfg, "out": out}) + "\n").encode())
+                self.proc.stdin.flush()
+                pid = self._line(timeout)
+                if pid is None:
+                    raise RuntimeError("E1 server not answering")
+                done = self._line(max(0.0, timeout - (time.monotonic() - t0)))
+                if done is None:
+                    try:
+                        os.kill(pid["pid"], 9)
+                    except OSError:
+                        pass
+                    if self._line(timeout) is None:
+                        raise RuntimeError("E1 server stuck")
+                    raise subprocess.TimeoutExpired("e1", timeout)
+                with open(out, encoding="utf-8") as fh:
+                    return fh.read()
+            finally:
+                os.unlink(out)
+        except subprocess.TimeoutExpired:
+            raise
+        except Exception:
+            self.close()
+            self.dead = True
+            return None
+
+    def close(self):
+        if self.proc is not None:
+            try:
+                self.proc.stdin.close()
+                self.proc.wait(timeout=CHILD_TIMEOUT_S)
+            except Exception:
+                self.proc.kill()
+                self.proc.wait()
+            self.proc = None
+
+
+_SERVER = _Server()
+
+
+def close_server():
+    _SERVER.close()
 
 
 def _modname(rel):
@@ -341,34 +536,37 @@ def _modname(rel):
     return (name[: -len(".__init__")] if is_pkg else name), is_pkg
 
 
-def recompute(src_root, patched_files, work, timeout=CHILD_TIMEOUT_S, expect=None):
-    """Boundary digests under the patched sources, in an isolated interpreter.
-    patched_files: {rel path: new text}; work: {kind: [query index]}. None on any failure."""
+def recompute(src_root, patched_files, work, timeout=CHILD_TIMEOUT_S, expect=None, fixtures=None):
+
+
     import tempfile
     mods = {}
     for rel, text in patched_files.items():
         name, is_pkg = _modname(rel)
         mods[name] = [text, is_pkg, str(Path(src_root) / rel).replace("\\", "/")]
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as fh:
-        json.dump({"patched": mods, "work": work, "expect": expect or {}}, fh)
+        json.dump({"patched": mods, "work": work, "expect": expect or {}, "fixtures": fixtures or {}}, fh)
         tmp = fh.name
     try:
-        env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")  # -I: random hash seed, digests must not depend on it
+        env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+        out = _SERVER.run(src_root, tmp, set(mods), timeout, env)
+        if out is not None:
+            return json.loads(out.strip().splitlines()[-1])
         r = subprocess.run([sys.executable, "-I", "-S", "-c", _CHILD, tmp, str(src_root),
                             str(Path(__file__).resolve().parent)],
                            capture_output=True, text=True, timeout=timeout, env=env)
         return json.loads(r.stdout.strip().splitlines()[-1])
-    except Exception:  # noqa: BLE001
+    except Exception:
         return None
     finally:
         os.unlink(tmp)
 
 
-# ------------------------------------------------------------------ the runtime rule
+
 
 class Cutoff:
     def __init__(self, path, m=None):
-        if m is None:  # m: the map's decoded JSON when the caller already has it
+        if m is None:
             with gzip.open(path, "rt", encoding="utf-8") as fh:
                 m = json.load(fh)
         self.tests = {}
@@ -381,8 +579,8 @@ class Cutoff:
             }
 
     def plan(self, tid, regions):
-        """regions: [(old path, [(lo, hi), ...])] that brought test tid in. Returns the query
-        indices to recompute, or None when the rule cannot apply."""
+
+
         d = self.tests.get(tid)
         if d is None:
             return None
@@ -391,19 +589,19 @@ class Cutoff:
             ex = d["E"].get(path, ())
             for lo, hi in ranges:
                 if any(lo <= ln <= hi for ln in ex):
-                    return None  # the changed statement runs in the execute phase
+                    return None
                 hit = False
                 for i, q in enumerate(d["Q"]):
                     if any(lo <= ln <= hi for ln in q.get(path, ())):
                         qs.add(i)
                         hit = True
                 if not hit:
-                    return None  # per range: the map says the test ran it, the phase trace did not: be safe
+                    return None
         return sorted(qs)
 
     def droppable(self, src_root, patched_files, wants):
-        """wants: {test id: [(path, ranges)]}. Returns ({test id: reason}) for tests proven
-        unaffected; every other test is kept."""
+
+
         work, plans = {}, {}
         for tid, regions in wants.items():
             p = self.plan(tid, regions)
@@ -414,7 +612,7 @@ class Cutoff:
         if not work:
             return {}
         expect = {t["kind"]: t["fp"] for t in self.tests.values()}
-        got = recompute(src_root, patched_files, {k: sorted(v) for k, v in work.items()}, expect=expect)
+        got = recompute(src_root, patched_files, {k: {"idx": sorted(v)} for k, v in work.items()}, expect=expect)
         if not got:
             return {}
         out = {}

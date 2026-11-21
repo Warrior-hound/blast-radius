@@ -6,3 +6,9 @@
 !r1map.json.gz
 !e2_ns.py
 !e2map.json.gz
+!fixture_openers.json
+!verify.py
+!vserve.py
+!vtests.json
+!prof.py
+!order_state.py
