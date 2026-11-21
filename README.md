@@ -13,9 +13,14 @@ For each sqlglot patch, pick the tests that can catch it and split them over at 
    module-level statement also selects every test that used that class or module.
 4. **Import check:** when import-time code changed, the patched modules are imported in a throwaway
    interpreter; a crash there selects every test that imports them.
-5. **Fallbacks:** test configuration, unparseable or non-applying patches, and deleted modules widen
+5. **Compile-stage cutoff for the TPC executor tests** (`e1_cutoff.py`, `e1map.json.gz`): when a changed
+   function runs only while the TPC-H/TPC-DS queries are parsed, optimized and planned, the patched modules
+   recompute those compile outputs in a throwaway interpreter; if every fingerprint matches the pinned one,
+   the executor never sees a difference and those tests are not selected. Any mismatch, error or budget
+   overrun keeps them.
+6. **Fallbacks:** test configuration, unparseable or non-applying patches, and deleted modules widen
    the selection instead of guessing.
-6. **Packing:** longest test first onto the least-loaded worker, with the worker count chosen to minimize
+7. **Packing:** longest test first onto the least-loaded worker, with the worker count chosen to minimize
    the busiest worker's time plus 2 s per worker.
 
 No table from patches or edit kinds to tests is used anywhere: the selection is computed from the patch

@@ -33,12 +33,14 @@ MAP = Path(os.environ.get("RWX_MAP", APP / "map.json.gz"))
 MAX_WORKERS = 8
 # Rule switches, for measuring each rule's effect on labeled sets (defaults are what ships).
 IMPORT_TIME_RULE = os.environ.get("RWX_IMPORT_TIME_RULE", "0") == "1"  # off: costs ~43 s on the sample, caught 0 misses so far
+E1 = os.environ.get("RWX_E1", "1") == "1"  # on by default; stage-boundary early cutoff for the TPC executor tests (e1_cutoff.py)
 WORKER_COST_MS = 2000
 PROBE_TIMEOUT_S = 10  # measured probes take <= 0.6 s
 # The run's time limit for the whole batch (spec: 3 min practice, 4.5 min final with ~1.5x commits).
 # Use the smaller one; once a safe fraction of it is spent, skip import probes and widen instead.
 RUN_LIMIT_S = float(os.environ.get("RWX_RUN_LIMIT_S", "180"))
 SAFE_FRACTION = 0.5  # import probes stop here
+E1_BUDGET_S = 0.15 * RUN_LIMIT_S  # E1 checks stop (keeping their tests) once they have used this much
 WATCHDOG_FRACTION = 0.7  # every unanswered commit gets the whole suite here
 
 CONFIG_FILES = {"conftest.py", "tests/conftest.py", "setup.cfg", "pytest.ini", "tox.ini", "pyproject.toml"}
@@ -174,15 +176,38 @@ def _line_number_consts(co):
     without changing behavior. Normalized only when that constant is loaded nowhere else."""
     if "__firstlineno__" not in co.co_names:
         return ()
-    import dis
-    ins = list(dis.get_instructions(co))
-    out = []
-    for a, b in zip(ins, ins[1:]):
-        if a.opname == "LOAD_CONST" and b.opname == "STORE_NAME" and b.argval == "__firstlineno__":
-            uses = sum(1 for i in ins if i.opname == "LOAD_CONST" and i.arg == a.arg)
-            if uses == 1 and type(co.co_consts[a.arg]) is int:
-                out.append(a.arg)
-    return tuple(out)
+    # The candidate constant indexes depend only on the instruction stream (co_code) and the
+    # STORE_NAME targets (co_names), so they are memoized on those; the int check is per object.
+    key = (co.co_code, co.co_names)
+    cand = _LNC_CACHE.get(key)
+    if cand is None:
+        import dis
+        ins = list(dis.get_instructions(co))
+        cand = []
+        for a, b in zip(ins, ins[1:]):
+            if a.opname == "LOAD_CONST" and b.opname == "STORE_NAME" and b.argval == "__firstlineno__":
+                uses = sum(1 for i in ins if i.opname == "LOAD_CONST" and i.arg == a.arg)
+                if uses == 1:
+                    cand.append(a.arg)
+        if len(_LNC_CACHE) > 4096:
+            _LNC_CACHE.clear()
+        _LNC_CACHE[key] = cand
+    return tuple(i for i in cand if type(co.co_consts[i]) is int)
+
+
+_LNC_CACHE = {}
+
+
+def _signatures_differ(oco, nco):
+    """Same result as _own_signature(oco) != _own_signature(nco), checking the cheap fields first."""
+    if (oco.co_code != nco.co_code or oco.co_names != nco.co_names or oco.co_varnames != nco.co_varnames
+            or oco.co_freevars != nco.co_freevars or oco.co_cellvars != nco.co_cellvars
+            or oco.co_argcount != nco.co_argcount or oco.co_posonlyargcount != nco.co_posonlyargcount
+            or oco.co_kwonlyargcount != nco.co_kwonlyargcount or oco.co_flags != nco.co_flags
+            or getattr(oco, "co_exceptiontable", b"") != getattr(nco, "co_exceptiontable", b"")
+            or oco.co_name != nco.co_name or len(oco.co_consts) != len(nco.co_consts)):
+        return True
+    return _own_signature(oco) != _own_signature(nco)
 
 
 def _own_signature(co):
@@ -256,13 +281,32 @@ class _FileInfo:
         self.tree = ast.parse(text)
         self.funcs = {}
         self.strings = set()  # lines inside multi-line string literals
-        for n in ast.walk(self.tree):
-            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        # Same nodes as ast.walk would yield for what is collected here: a node that fits on one
+        # line can contain neither a def (a def is a statement; a one-line statement holds no other
+        # def) nor a multi-line literal (children lie inside their parent's lines), so its subtree
+        # is skipped. funcs lists are only ever tested for a single match, so order is irrelevant.
+        AST, FN, STR = ast.AST, (ast.FunctionDef, ast.AsyncFunctionDef), (ast.Constant, ast.JoinedStr)
+        todo = [self.tree]
+        pop, push = todo.pop, todo.append
+        while todo:
+            n = pop()
+            if isinstance(n, FN):
                 self.funcs.setdefault(_first_line(n), []).append(n)
                 if n.lineno != _first_line(n):
                     self.funcs.setdefault(n.lineno, []).append(n)
-            elif isinstance(n, (ast.Constant, ast.JoinedStr)) and n.end_lineno > n.lineno:
+            elif isinstance(n, STR) and n.end_lineno > n.lineno:
                 self.strings.update(range(n.lineno, n.end_lineno + 1))
+            lo = getattr(n, "lineno", None)
+            if lo is not None and lo == getattr(n, "end_lineno", None):
+                continue
+            for f in n._fields:
+                v = getattr(n, f, None)
+                if isinstance(v, AST):
+                    push(v)
+                elif isinstance(v, list):
+                    for x in v:
+                        if isinstance(x, AST):
+                            push(x)
 
     def func(self, co):
         c = [n for n in self.funcs.get(co.co_firstlineno, ()) if n.name == co.co_name]
@@ -351,6 +395,52 @@ def _same_frame(oco, nco):
             and oco.co_kwonlyargcount == nco.co_kwonlyargcount)
 
 
+_CLS_LIKE = ("cls", "mcs", "klass", "metacls")
+
+
+def _writes_persistent(fn, co):
+    """True when the function body (not nested defs or lambdas) stores into state that outlives the
+    call: a `global`/`nonlocal` statement, or a subscript/attribute store or delete whose base is a
+    module-level name or the class argument (`CACHE[k] = v`, `mod.X = v`, `cls.x = v`). Such a store
+    can carry an edited statement's effect to tests that never execute that statement."""
+    local = set(co.co_varnames) | set(co.co_cellvars) | set(co.co_freevars)
+    params = fn.args.posonlyargs + fn.args.args
+    cls_arg = params[0].arg if params and params[0].arg in _CLS_LIKE else None
+    todo = list(fn.body)
+    while todo:
+        n = todo.pop()
+        if isinstance(n, (ast.Global, ast.Nonlocal)):
+            return True
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            continue
+        tgts = ()
+        if isinstance(n, ast.Assign):
+            tgts = n.targets
+        elif isinstance(n, (ast.AugAssign, ast.AnnAssign)):
+            tgts = [n.target]
+        elif isinstance(n, ast.Delete):
+            tgts = n.targets
+        elif isinstance(n, (ast.For, ast.AsyncFor, ast.comprehension)):
+            tgts = [n.target]
+        elif isinstance(n, (ast.withitem,)) and n.optional_vars is not None:
+            tgts = [n.optional_vars]
+        stack = list(tgts)
+        while stack:
+            t = stack.pop()
+            if isinstance(t, (ast.Tuple, ast.List)):
+                stack.extend(t.elts)
+            elif isinstance(t, ast.Starred):
+                stack.append(t.value)
+            elif isinstance(t, (ast.Subscript, ast.Attribute)):
+                b = t.value
+                while isinstance(b, (ast.Subscript, ast.Attribute)):
+                    b = b.value
+                if isinstance(b, ast.Name) and (b.id == cls_arg or b.id not in local):
+                    return True
+        todo.extend(ast.iter_child_nodes(n))
+    return False
+
+
 def _code_lines(co):
     return {ln for _, _, ln in co.co_lines() if ln is not None}
 
@@ -362,6 +452,8 @@ def statement_ranges(oco, nco, old_fi, new_fi, diff):
         return None
     ofn, nfn = old_fi.func(oco), new_fi.func(nco)
     if ofn is None or nfn is None:
+        return None
+    if _writes_persistent(ofn, oco) or _writes_persistent(nfn, nco):
         return None
     removed, inserted, new2old = diff
     ost, nst = _stmts(ofn), _stmts(nfn)
@@ -448,11 +540,39 @@ def statement_ranges(oco, nco, old_fi, new_fi, diff):
 _compiled = {}
 
 
+CACHE = APP / "cache"  # written at image build (`selector.py --precompute`); every use is checked
+
+
+def _cache_file(kind, path):
+    return CACHE / kind / (path.replace("/", "__") + ".bin")
+
+
 def compile_old(path, text):
     co = _compiled.get(path)
     if co is None:
-        co = _compiled[path] = compile(text, path, "exec", dont_inherit=True)
+        co = _load_old_code(path, text)
+        if co is None:
+            co = compile(text, path, "exec", dont_inherit=True)
+        _compiled[path] = co
     return co
+
+
+def _load_old_code(path, text):
+    """The pinned file's code object, compiled at image build. Used only when the cached source
+    digest matches this exact text (otherwise None: compile it here)."""
+    import hashlib
+    import marshal
+    try:
+        raw = _cache_file("code", path).read_bytes()
+    except OSError:
+        return None
+    if raw[:40] != hashlib.sha1(text.encode("utf-8", "surrogatepass")).hexdigest().encode():
+        return None
+    try:
+        co = marshal.loads(raw[40:])
+    except Exception:
+        return None
+    return co if isinstance(co, types.CodeType) and co.co_filename == path else None
 
 
 def code_changes(path, old_text, new_text, hunks=None):
@@ -500,7 +620,7 @@ def code_changes(path, old_text, new_text, hunks=None):
             parent = old_map.get(scope_of(key))
             if parent is not None and key:
                 add(parent)
-        elif _own_signature(oco) != _own_signature(nco):
+        elif _signatures_differ(oco, nco):
             add(oco, narrowed(oco, nco) if kind(oco) == "func" else None)
     for key in new_map:
         if key not in old_map:
@@ -602,6 +722,210 @@ def _probe_all():
         os.unlink(tmp)
 
 
+# Warm probe parent. A cold probe is a fresh `python -I -S` that runs _IMPORT_PROBE: it imports
+# sqlglot with the patched modules served from memory, then each patched module and importer. The
+# warm parent is that same interpreter (same flags, sys.path, meta_path finder, argv shape) stopped
+# right after its unpatched `import sqlglot`; it records every module name the import system was
+# asked for during that import. For a probe whose patched modules include none of those names, a
+# fresh probe's `import sqlglot` runs exactly the same code, so a fork of the parent is in the state
+# the fresh probe reaches there; the child then installs the patched sources, runs the rest of
+# _IMPORT_PROBE unchanged and exits through normal interpreter shutdown (threads joined, atexit
+# run). Probes that patch a module that `import sqlglot` itself asks for run cold, as before.
+_PROBE_SERVER = r"""
+import importlib.abc, importlib.util, json, sys, os
+patched = {}
+root = sys.argv[1]
+class Finder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+    def find_spec(self, name, path, target=None):
+        if name in patched:
+            is_pkg = patched[name][1]
+            return importlib.util.spec_from_loader(name, self, origin=patched[name][2], is_package=is_pkg)
+        return None
+    def create_module(self, spec):
+        return None
+    def exec_module(self, module):
+        src, is_pkg, origin = patched[module.__name__]
+        if is_pkg:
+            module.__path__ = [origin.rsplit("/", 1)[0]]
+        module.__file__ = origin
+        exec(compile(src, origin, "exec"), module.__dict__)
+class _Asked(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path, target=None):
+        _asked.add(name)
+        return None
+_asked = set()
+sys.argv = ["-c", "", root]
+sys.path.insert(0, root)
+sys.meta_path.insert(0, Finder())
+_rec = _Asked()
+sys.meta_path.insert(0, _rec)
+_ok = True
+try:
+    import sqlglot
+except BaseException:
+    _ok = False
+sys.meta_path.remove(_rec)
+sys.stderr.flush()
+_asked |= set(sys.modules)
+os.write(1, (json.dumps({"ok": _ok, "asked": sorted(_asked)}) + "\n").encode())
+_inp = sys.stdin.buffer
+while _ok:
+    _line = _inp.readline()
+    if not _line:
+        break
+    _req = json.loads(_line)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    _pid = os.fork()
+    if _pid == 0:
+        _fd = os.open(_req["out"], os.O_WRONLY | os.O_TRUNC)
+        os.dup2(_fd, 1)
+        os.close(_fd)
+        _fd = os.open(_req["err"], os.O_WRONLY | os.O_APPEND)
+        os.dup2(_fd, 2)
+        os.close(_fd)
+        _fd = os.open(os.devnull, os.O_RDONLY)
+        os.dup2(_fd, 0)
+        os.close(_fd)
+        sys.argv = ["-c", _req["cfg"], root]
+        _cfg = json.load(open(sys.argv[1], encoding="utf-8"))
+        patched.update(_cfg["patched"])
+        failed = []
+        try:
+            import sqlglot
+        except BaseException as e:
+            failed.append("sqlglot")
+        for name in list(patched) + _cfg["extra"]:
+            try:
+                importlib.import_module(name)
+            except BaseException as e:
+                failed.append(name)
+        print(json.dumps(failed))
+        sys.exit(0)
+    os.write(1, (json.dumps({"pid": _pid}) + "\n").encode())
+    os.waitpid(_pid, 0)
+    os.write(1, b'{"done": 1}\n')
+"""
+
+
+class _ProbeServer:
+    def __init__(self):
+        self.proc, self.asked, self.dead, self.buf, self.err0 = None, None, False, b"", None
+
+    def _start(self):
+        import subprocess
+        import tempfile
+        fd, self.err0 = tempfile.mkstemp(suffix=".err")  # the parent's own stderr: import-time output
+        os.close(fd)
+        with open(self.err0, "wb") as err:
+            self.proc = subprocess.Popen([sys.executable, "-I", "-S", "-c", _PROBE_SERVER, str(SRC)],
+                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err)
+        hello = self._line(PROBE_TIMEOUT_S * 3)
+        if not hello or not hello.get("ok"):
+            raise RuntimeError("probe server unavailable")
+        self.asked = set(hello["asked"])
+        with open(self.err0, "rb") as fh:
+            self.prefix = fh.read()  # what a cold probe prints to stderr during `import sqlglot`
+
+    def _line(self, timeout):
+        import select
+        deadline = time.monotonic() + timeout
+        fd = self.proc.stdout.fileno()
+        while b"\n" not in self.buf:
+            left = deadline - time.monotonic()
+            if left <= 0 or not select.select([fd], [], [], left)[0]:
+                return None
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                raise RuntimeError("probe server exited")
+            self.buf += chunk
+        line, self.buf = self.buf.split(b"\n", 1)
+        return json.loads(line)
+
+    def run(self, cfg, names):
+        """CompletedProcess-like result of the probe, or None when it must run cold."""
+        import io
+        import subprocess
+        import tempfile
+        if self.dead or not hasattr(os, "fork"):
+            return None
+        try:
+            if self.proc is None:
+                self._start()
+            if names & self.asked:
+                return None
+            fo, out = tempfile.mkstemp(suffix=".out")
+            fe, err = tempfile.mkstemp(suffix=".err")
+            try:
+                os.write(fe, self.prefix)
+                os.close(fo)
+                os.close(fe)
+                t0 = time.monotonic()
+                self.proc.stdin.write((json.dumps({"cfg": cfg, "out": out, "err": err}) + "\n").encode())
+                self.proc.stdin.flush()
+                pid = self._line(PROBE_TIMEOUT_S)
+                if pid is None:
+                    raise RuntimeError("probe server not answering")
+                done = self._line(max(0.0, PROBE_TIMEOUT_S - (time.monotonic() - t0)))
+                if done is None:
+                    try:
+                        os.kill(pid["pid"], 9)
+                    except OSError:
+                        pass
+                    if self._line(PROBE_TIMEOUT_S) is None:
+                        raise RuntimeError("probe server stuck")
+                    raise subprocess.TimeoutExpired("probe", PROBE_TIMEOUT_S)
+
+                def text(p):
+                    with open(p, "rb") as fh:
+                        return io.TextIOWrapper(io.BytesIO(fh.read())).read()
+                return subprocess.CompletedProcess("probe", 0, text(out), text(err))
+            finally:
+                for p in (out, err):
+                    try:
+                        os.unlink(p)
+                    except OSError:
+                        pass
+        except subprocess.TimeoutExpired:
+            raise
+        except Exception as e:
+            log(f"probe server off ({type(e).__name__}: {e}): cold probes from here on")
+            self.close()
+            self.dead = True
+            return None
+
+    def close(self):
+        if self.proc is not None:
+            try:
+                self.proc.stdin.close()
+                self.proc.wait(timeout=PROBE_TIMEOUT_S)
+            except Exception:
+                self.proc.kill()
+                self.proc.wait()
+            self.proc = None
+        if self.err0:
+            try:
+                os.unlink(self.err0)
+            except OSError:
+                pass
+            self.err0 = None
+
+
+_SERVER = None
+
+
+def _probe_server():
+    global _SERVER
+    if _SERVER is None:
+        _SERVER = _ProbeServer()
+    return _SERVER
+
+
+def _close_probe_server():
+    if _SERVER is not None:
+        _SERVER.close()
+
+
 def import_fails(src_root, patched_files, also_import=()):
     """Import the patched modules (plus sqlglot itself) in a throwaway interpreter.
     patched_files: {relative path: new source}. True when the import raises."""
@@ -622,8 +946,12 @@ def import_fails(src_root, patched_files, also_import=()):
         json.dump({"patched": mods, "extra": extra}, fh)
         tmp = fh.name
     try:
-        r = subprocess.run([sys.executable, "-I", "-S", "-c", _IMPORT_PROBE, tmp, str(src_root)],
-                           capture_output=True, text=True, timeout=PROBE_TIMEOUT_S)
+        r = None
+        if str(src_root) == str(SRC):
+            r = _probe_server().run(tmp, set(mods))  # None: not eligible, run it the cold way
+        if r is None:
+            r = subprocess.run([sys.executable, "-I", "-S", "-c", _IMPORT_PROBE, tmp, str(src_root)],
+                               capture_output=True, text=True, timeout=PROBE_TIMEOUT_S)
         try:
             failed = set(json.loads(r.stdout.strip().splitlines()[-1]))
         except Exception:
@@ -635,6 +963,71 @@ def import_fails(src_root, patched_files, also_import=()):
         return True, "timeout"
     finally:
         os.unlink(tmp)
+
+
+# ---------------------------------------------------------------- compact map
+
+def _map_digest(raw):
+    import hashlib
+    return hashlib.sha1(raw).hexdigest().encode()
+
+
+def build_compact_map(map_path, out_path):
+    """Image build step: the same map with each test set and each file's line table packed as
+    uint32 arrays, so loading it is a memcpy and only the sets a commit touches get decoded."""
+    import marshal
+    from array import array
+    raw = Path(map_path).read_bytes()
+    m = json.loads(gzip.decompress(raw).decode("utf-8"))
+    c = dict(m)
+    c["sets"] = [array("I", s).tobytes() for s in m["sets"]]
+    c["lines"] = {f: (array("I", [int(ln) for ln in d]).tobytes(), array("I", list(d.values())).tobytes())
+                  for f, d in m["lines"].items()}
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(out_path).write_bytes(_map_digest(raw) + marshal.dumps(c))
+
+
+def _load_compact_map(map_path):
+    """The compact copy when it was built from exactly this map file, else None."""
+    import marshal
+    try:
+        cached = (CACHE / "map.bin").read_bytes()
+        if cached[:40] != _map_digest(Path(map_path).read_bytes()):
+            return None
+        return marshal.loads(cached[40:])
+    except Exception:
+        return None
+
+
+class _LazySets:
+    def __init__(self, packed, idx_to_num):
+        self.packed, self.idx, self.done = packed, idx_to_num, {}
+
+    def __getitem__(self, sid):
+        v = self.done.get(sid)
+        if v is None:
+            from array import array
+            idx = self.idx
+            if sid < 0:
+                sid += len(self.packed)
+            v = self.done[sid] = frozenset(idx[i] for i in array("I", self.packed[sid]) if idx[i] is not None)
+        return v
+
+
+class _LazyLines:
+    def __init__(self, packed):
+        self.packed, self.done = packed, {}
+
+    def get(self, path, default=None):
+        v = self.done.get(path)
+        if v is None:
+            p = self.packed.get(path)
+            if p is None:
+                return default
+            from array import array
+            v = self.done[path] = dict(zip(array("I", p[0]), array("I", p[1])))
+        return v
+
 
 
 # ---------------------------------------------------------------- the selector
@@ -659,22 +1052,34 @@ def lpt_pack(ms, chosen):
 
 class Selector:
     def __init__(self, map_path, tests):
-        with gzip.open(map_path, "rt", encoding="utf-8") as fh:
-            m = json.load(fh)
+        m = _load_compact_map(map_path)
         self.number = {t["id"]: t["number"] for t in tests}
         # the scorer's rounding: floor(seconds * 1000 + 0.5)
         self.ms = {t["number"]: math.floor(t["seconds"] * 1000 + 0.5) for t in tests}
         self.insurance = []  # per select(): unselected tests worth running for free, most plausible first
         self.all = set(self.ms)
-        idx_to_num = [self.number.get(t) for t in m["tests"]]
-        self.sets = [frozenset(idx_to_num[i] for i in s if idx_to_num[i] is not None) for s in m["sets"]]
-        self.lines = {f: {int(ln): sid for ln, sid in d.items()} for f, d in m["lines"].items()}
+        idx_to_num = [self.number.get(t) for t in (m or {}).get("tests", ())]
+        if m is not None:  # build-time compact copy of this exact map: decode sets/lines on use
+            self.sets = _LazySets(m["sets"], idx_to_num)
+            self.lines = _LazyLines(m["lines"])
+        else:
+            with gzip.open(map_path, "rt", encoding="utf-8") as fh:
+                m = json.load(fh)
+            idx_to_num = [self.number.get(t) for t in m["tests"]]
+            self.sets = [frozenset(idx_to_num[i] for i in s if idx_to_num[i] is not None) for s in m["sets"]]
+            self.lines = {f: {int(ln): sid for ln, sid in d.items()} for f, d in m["lines"].items()}
         self.opened = m["opened"]
         self.collect = {f: set(v) for f, v in m["collect"].items()}
         self.classes = m.get("classes", {})
         self.importers = m.get("importers", {})
         traced_ids = set(m["tests"]) - set(m["missing"])
         self.untraced = {t["number"] for t in tests if t["id"] not in traced_ids}
+        self.e1, self.e1_nums, self.e1_ids, self.e1_spent = None, set(), {}, 0.0
+        if E1 and (APP / "e1map.json.gz").exists():
+            import e1_cutoff
+            self.e1 = e1_cutoff.Cutoff(APP / "e1map.json.gz")
+            self.e1_ids = {self.number[t]: t for t in self.e1.tests if t in self.number}
+            self.e1_nums = set(self.e1_ids)
         self.by_file = {}
         for t in tests:
             self.by_file.setdefault(t["file"], set()).add(t["number"])
@@ -749,6 +1154,7 @@ class Selector:
         if not files:
             return set(), ["empty patch"]
         chosen = set()
+        e1_soft, e1_files = [], {}  # E1: (path, ranges, deferred tests) per function edit; patched sources
         scope_changed = {}  # sqlglot module path -> new source, for the import check
         for f in files:
             old, new = f["old"], f["new"]
@@ -796,6 +1202,7 @@ class Selector:
                 why.append(f"{old}: data file -> openers {len(sel)}")
                 continue
             status, regions = code_changes(old, old_text, new_text, f["hunks"])
+            e1_files[old] = new_text
             if status == "null":
                 why.append(f"{old}: bytecode-identical -> none")
                 continue
@@ -808,6 +1215,12 @@ class Selector:
             tiers[1] |= self.file_tests(old)
             tiers[2] |= self.class_users(old, "<module>")
             col = self.collect.get(old, set())
+            if regions and importable(old) and old not in self.collect:
+                # Never imported at collection: tests import it lazily (a dialect loaded inside a
+                # test), so its import-time code, including functions its module or class bodies
+                # call, ran inside some test and is not in `collect`. Any code change may then crash
+                # the import: probe it.
+                scope_changed[old] = new_text
             narrowed = 0
             for kind, ranges, qualname, (lo, hi), own in regions:
                 at_import = kind == "func" and bool(own & col)
@@ -820,6 +1233,9 @@ class Selector:
                 hit = set()
                 for a, b in ranges:
                     hit |= self.touching(old, a, b)
+                if self.e1 and kind == "func" and not at_import and old.startswith("sqlglot/"):
+                    e1_soft.append((old, ranges, hit & self.e1_nums))
+                    hit = hit - self.e1_nums  # decided after the loop, by the boundary check
                 sel |= hit
                 if ranges != [(lo, hi)]:
                     tiers[0] |= self.touching(old, lo, hi)
@@ -866,9 +1282,26 @@ class Selector:
                 why.append(f"import fails ({detail.strip().splitlines()[-1:]}) -> users of {len(files_)} modules: {len(sel)}")
             else:
                 why.append("import check ok")
+        if e1_soft:
+            chosen |= self.e1_check(e1_soft, e1_files, chosen, why)
         if chosen and self.untraced:
             chosen |= self.untraced
         return chosen, why
+
+    def e1_check(self, soft, files, hard, why):
+        """Deferred E1 tests to keep: all of them, except those whose only reasons are edits that
+        run in the compile phase alone and leave every boundary fingerprint unchanged."""
+        wants = {}
+        for path, ranges, tests in soft:
+            for n in tests - hard:
+                wants.setdefault(self.e1_ids[n], []).append((path, ranges))
+        if not wants or self.e1_spent > E1_BUDGET_S:
+            return {self.number[tid] for tid in wants}
+        t = time.monotonic()
+        dropped = self.e1.droppable(SRC, files, wants)
+        self.e1_spent += time.monotonic() - t
+        why.append(f"E1 {len(dropped)}/{len(wants)} dropped ({time.monotonic() - t:.1f}s): {sorted(dropped)}")
+        return {self.number[tid] for tid in wants if tid not in dropped}
 
     def pack(self, chosen):
         if not chosen:
@@ -892,11 +1325,37 @@ class Selector:
         return bins
 
 
+def precompute():
+    import hashlib
+    import marshal
+    try:
+        build_compact_map(MAP, CACHE / "map.bin")
+    except Exception as e:
+        log(f"compact map not built ({type(e).__name__}: {e}): the gzip JSON map will be used")
+    n = 0
+    for p in sorted(SRC.rglob("*.py")):
+        rel = p.relative_to(SRC).as_posix()
+        try:
+            text = p.read_text(encoding="utf-8")
+            co = compile(text, rel, "exec", dont_inherit=True)
+        except Exception:
+            continue
+        f = _cache_file("code", rel)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_bytes(hashlib.sha1(text.encode("utf-8", "surrogatepass")).hexdigest().encode() + marshal.dumps(co))
+        n += 1
+    log(f"precompute: compact map, {n} compiled pinned files")
+
+
+
 def main():
     if sys.argv[1:] == ["--baseline"]:  # image build step
         base = sorted(_probe_all())
         (APP / "import_baseline.json").write_text(json.dumps(base), encoding="utf-8")
         log(f"import baseline: {len(base)} modules fail without any patch: {base}")
+        return
+    if sys.argv[1:] == ["--precompute"]:  # image build step: caches that are verified on every use
+        precompute()
         return
     t0 = time.monotonic()
     tests = json.loads((DATA / "tests.json").read_text(encoding="utf-8"))["tests"]
@@ -926,7 +1385,7 @@ def main():
         text = patch.read_text(encoding="utf-8", errors="replace")
         # time check: stop probing once the spent time, or the projection of the mean time per
         # commit so far over the remaining commits, passes the safe fraction of the run limit
-        spent = time.monotonic() - t0
+        spent = time.monotonic() - t0 - sel.e1_spent  # E1 has its own budget
         projected = spent + (spent / i) * (len(patches) - i) if i else spent
         allow_probe = max(spent, projected) < SAFE_FRACTION * RUN_LIMIT_S
         try:
@@ -941,6 +1400,7 @@ def main():
         log(f"{patch.stem}: {len(chosen)} tests, {len(workers)} workers | " + "; ".join(why))
     timer.cancel()
     sys.stdout.flush()
+    _close_probe_server()
     t = os.times()
     log(f"CPU self user+sys {t.user + t.system:.3f}s children {t.children_user + t.children_system:.3f}s")
 
