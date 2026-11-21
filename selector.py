@@ -46,6 +46,115 @@ WATCHDOG_FRACTION = 0.7  # every unanswered commit gets the whole suite here
 CONFIG_FILES = {"conftest.py", "tests/conftest.py", "setup.cfg", "pytest.ini", "tox.ini", "pyproject.toml"}
 
 
+# E2: class-body / module-level value edits select only the tests that READ a changed attribute,
+# global or table key (read map traced at the pinned commit + namespace diff of a patched import).
+E2 = os.environ.get("RWX_E2", "0") == "1"
+# E2_PRUNE off (guard g8, add-only): the diff runs only when a module's bindings change and only ADDS
+# the readers of the registries it changed; v7's selection is kept whole. On: readers also replace
+# class_users / name_readers for class-body and module-level value edits.
+E2_PRUNE = os.environ.get("RWX_E2_PRUNE", "0") == "1"
+E2_MAP = Path(os.environ.get("RWX_E2_MAP", APP / "e2map.json.gz"))
+E2_TIMEOUT_S = 20
+E2_COST_MS = 1600  # measured CPU of one namespace diff (interpreter, import, fingerprint)
+E2_FP = Path(os.environ.get("RWX_E2_FP", APP / "cache" / "e2fp.pickle"))  # written at image build
+E2_CANON = E2_FP.with_suffix(".canon.json")
+
+
+def _scope_bindings(body):
+    """{name: [statement dumps]} for the bindings a module or class body makes directly (assignments,
+    imports, docstring), plus the dumps of its other non-def statements (key None)."""
+    out = {}
+
+    def add(k, v):
+        out.setdefault(k, []).append(v)
+
+    def walk(stmts, first):
+        for i, st in enumerate(stmts):
+            if first and i == 0 and isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant)                     and isinstance(st.value.value, str):
+                add("__doc__", ast.dump(st))
+            elif isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                add(("def", st.name), "def")  # bodies: code regions / class bodies below
+            elif isinstance(st, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                tg = st.targets if isinstance(st, ast.Assign) else [st.target]
+                names = [n.id for t in tg for n in ast.walk(t) if isinstance(n, ast.Name)]
+                if not names or any(not isinstance(t, (ast.Name, ast.Tuple, ast.List)) for t in tg):
+                    add(None, ast.dump(st))
+                for n in names:
+                    add(n, ast.dump(st))
+            elif isinstance(st, ast.Import):
+                for al in st.names:
+                    add(al.asname or al.name.split(".")[0], ("import", al.name, al.asname))
+            elif isinstance(st, ast.ImportFrom):
+                for al in st.names:
+                    add(al.asname or al.name, ("from", st.module, st.level, al.name))
+            elif isinstance(st, (ast.If, ast.Try)) or (hasattr(ast, "TryStar") and isinstance(st, ast.TryStar)):
+                add(None, ("test", ast.dump(getattr(st, "test", ast.Constant(None)))))
+                for blk in ("body", "orelse", "finalbody"):
+                    walk(getattr(st, blk, []), False)
+                for hd in getattr(st, "handlers", []):
+                    walk(hd.body, False)
+            elif isinstance(st, ast.Pass):
+                continue
+            else:
+                add(None, ast.dump(st))
+    walk(body, True)
+    return out
+
+
+def e2_expected(path, old_text, new_text):
+    """What a namespace diff of this edit must show: (exact locations, location prefixes). Every
+    binding the edit changes at module or class scope must appear as a changed location; other
+    changed module / class statements need some change in that scope. None: cannot tell."""
+    try:
+        to, tn = ast.parse(old_text), ast.parse(new_text)
+    except (SyntaxError, ValueError):
+        return None
+    mod = path[:-3].replace("/", ".")
+    if mod.endswith(".__init__"):
+        mod = mod[: -len(".__init__")]
+    exact, prefixes = set(), set()
+
+    def classes(tree):
+        out = {}
+
+        def walk(body, pre):
+            for st in body:
+                if isinstance(st, ast.ClassDef):
+                    q = pre + st.name
+                    out[q] = st
+                    walk(st.body, q + ".")
+                elif isinstance(st, (ast.If, ast.Try)):
+                    walk(st.body, pre)
+                    walk(getattr(st, "orelse", []), pre)
+        walk(tree.body, "")
+        return out
+
+    def compare(bo, bn, loc_of, prefix):
+        a, b = _scope_bindings(bo), _scope_bindings(bn)
+        for k in set(a) | set(b):
+            if a.get(k) == b.get(k):
+                continue
+            if k is None:
+                prefixes.add(prefix)
+            elif isinstance(k, tuple):  # a def / class added or removed
+                exact.add(loc_of(k[1]))
+            else:
+                exact.add(loc_of(k))
+    compare(to.body, tn.body, lambda n: f"G|{mod}|{n}", f"G|{mod}|")
+    co, cn = classes(to), classes(tn)
+    for q in set(co) & set(cn):
+        compare(co[q].body, cn[q].body, lambda n, q=q: f"C|{mod}:{q}|{n}", f"C|{mod}:{q}|")
+    return exact, prefixes
+
+
+def _mod_file(mod):
+    """Pinned-tree path of module `mod`, or None."""
+    for rel in (mod.replace(".", "/") + ".py", mod.replace(".", "/") + "/__init__.py"):
+        if (SRC / rel).exists():
+            return rel
+    return None
+
+
 def log(*a):
     print(*a, file=sys.stderr)
 
@@ -1410,6 +1519,188 @@ class Selector:
         for t in tests:
             self.by_file.setdefault(t["file"], set()).add(t["number"])
         self._texts, self._scope_names, self._names_memo = {}, None, {}
+        self.e2 = None
+        if E2:
+            try:
+                self.e2 = self._e2_load()
+            except Exception as e:  # no E2 map: v6 behaviour
+                log(f"E2 map not loaded ({type(e).__name__}: {e})")
+
+    # ------------------------------------------------------------------ E2 read map
+    def _e2_load(self):
+        if not (E2_MAP.exists() and E2_FP.exists() and E2_CANON.exists()):
+            return None
+        with gzip.open(E2_MAP, "rt", encoding="utf-8") as fh:
+            m = json.load(fh)
+        if set(m["tests"]) != set(self.number) or m["missing"]:
+            log("E2 map does not cover this suite: off")
+            return None
+        m["idx"] = [self.number[t] for t in m["tests"]]
+        m["canon"] = set(json.loads(E2_CANON.read_text(encoding="utf-8")))
+        m["skipped"] = set(m["skipped"])
+        m["_sets"] = {}
+        return m
+
+    def _e2_set(self, sid):
+        e = self.e2
+        s = e["_sets"].get(sid)
+        if s is None:
+            idx = e["idx"]
+            s = e["_sets"][sid] = frozenset(idx[i] for i in e["sets"][sid])
+        return s
+
+    def _e2_attr_readers(self, cn, attr):
+        """Tests that looked `attr` up through class `cn` or a subclass. A receiver that is not a
+        canonical class (built with type() at run time: several share one name, so its recorded MRO
+        is ambiguous) counts as a subclass of everything."""
+        e = self.e2
+        out = set()
+        for recv, sid in e["attr"].get(attr, {}).items():
+            if recv not in e["canon"] or cn in e["mro"].get(recv, ()):
+                out |= self._e2_set(sid)
+        return out
+
+    def _e2_table_readers(self, oid, keys):
+        e = self.e2
+        out = set()
+        if oid in e["whole"]:
+            out |= self._e2_set(e["whole"][oid])
+        byk = e["key"].get(oid, {})
+        for k in keys:
+            if k in byk:
+                out |= self._e2_set(byk[k])
+        return out
+
+    def _e2_global_readers(self, mod, name):
+        """Lookups of module attribute `name` (present or not) through the module object, reads of
+        the module's whole namespace, and every executed line of its own functions that loads it."""
+        e = self.e2
+        out = set()
+        md = e["mod"].get(mod, {})
+        for n in (name, "__dict__", "__getattr__", "__all__"):
+            if n in md:
+                out |= self._e2_set(md[n])
+        rel = _mod_file(mod)
+        for ln in e["gread"].get(rel, {}).get(name, ()) if rel else ():
+            out |= self.touching(rel, ln, ln)
+        return out, rel is not None
+
+    def _e2_func_readers(self, metas):
+        out = set()
+        pre = str(SRC).replace("\\", "/").rstrip("/") + "/"
+        for fn, lo, hi, _ in metas:
+            fn = fn.replace("\\", "/")
+            if not fn.startswith(pre):
+                return None
+            out |= self.touching(fn[len(pre):], lo, hi)
+        return out
+
+    def e2_change_readers(self, ch):
+        """Tests that read namespace change `ch` (from e2_ns diff), or None when the map cannot say."""
+        loc, keys, status, ma, mb, ha, hb, override = ch
+        e = self.e2
+        oid = e["locs"].get(loc)
+        cls_valued = any(isinstance(h, str) and h.startswith("T:") for h in (ha, hb))
+        func = ma is not None or mb is not None
+        if func and (status != "changed" or ma is None or mb is None):
+            func = None  # function added or removed
+        if loc.startswith("C|"):
+            _, cn, attr = loc.split("|", 2)
+            if attr.startswith("__") and attr.endswith("__") and attr != "__doc__":
+                return None
+            if f"C|{cn}|*" in e["skipped"] or cls_valued or func is None:
+                return None
+            if func:
+                return self._e2_func_readers(ma)
+            if loc in e["skipped"]:
+                return None  # not instrumented
+            if status == "added":
+                # lookups through this class found the attribute on `override` before (a miss is
+                # not recorded): known only when that base location was traced as a data value
+                base = f"C|{override}|{attr}" if override else None
+                if base is None or base not in e["locs"] or base in e["skipped"]:
+                    return None
+            if keys is not None and oid is not None:
+                return self._e2_table_readers(oid, keys)
+            return self._e2_attr_readers(cn, attr)
+        _, mod, name = loc.split("|", 2)
+        if f"G|{mod}|*" in e["skipped"] or (name.startswith("__") and name.endswith("__") and name != "__all__"):
+            return None
+        if func:
+            return self._e2_func_readers(ma)
+        if keys is not None and oid is not None and status == "changed":
+            return self._e2_table_readers(oid, keys)
+        out, ok = self._e2_global_readers(mod, name)
+        return out if ok else None
+
+    def e2_readers(self, e2_files, expect=None, add_only=False):
+        """Namespace diff of the patched import, mapped to the tests that read what changed.
+        (None, why) when anything is unclear: the caller then keeps the v6 selection."""
+        import subprocess
+        import tempfile
+        mods = {}
+        for rel, text in e2_files.items():
+            name = rel[:-3].replace("/", ".")
+            is_pkg = name.endswith(".__init__")
+            if is_pkg:
+                name = name[: -len(".__init__")]
+            mods[name] = [text, is_pkg, str(SRC / rel).replace("\\", "/")]
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as fh:
+            json.dump({"patched": mods}, fh)
+            tmp = fh.name
+        try:
+            r = subprocess.run([sys.executable, "-I", "-S", str(APP / "e2_ns.py"), "diff", str(SRC), str(E2_FP), tmp],
+                               capture_output=True, text=True, timeout=E2_TIMEOUT_S,
+                               env={**os.environ, "PYTHONHASHSEED": "0"}, cwd=tempfile.gettempdir())
+            out = json.loads(r.stdout.strip().splitlines()[-1])
+        except Exception as ex:  # noqa: BLE001
+            return None, f"diff failed ({type(ex).__name__})"
+        finally:
+            os.unlink(tmp)
+        if "error" in out:
+            return None, "diff error: " + out["error"][:200]
+        if out.get("opaque") and not add_only:
+            return None, f"opaque value in a patched module: {out['opaque'][0]}"
+        changed = {c[0] for c in out["changes"]}
+        for exact, prefixes in (expect or {}).values() if not add_only else ():
+            miss = sorted(exact - changed) + sorted(p for p in prefixes if not any(c.startswith(p) for c in changed))
+            if miss:
+                return None, f"edit not seen by the diff: {miss[0]}"
+        sel = set()
+        for ch in out["changes"]:
+            r = self.e2_change_readers(ch)
+            if r is None and add_only:
+                continue  # add-only: what is mapped is still worth adding
+            if r is None:
+                return None, f"unmapped change {ch[0]} ({ch[2]})"
+            sel |= r
+            if os.environ.get("RWX_E2_DEBUG"):
+                log(f"  E2 {ch[0]} {ch[2]} keys={ch[1]} -> {len(r)}")
+        # a changed entry of a table whose values name modules (MODULE_BY_DIALECT and the like) moves
+        # a lazy import: the traced run had every module imported up front, so the lookups the lazy
+        # path makes were never recorded. Select every user of each module named.
+        for vals in out.get("strvals", {}).values():
+            for v in vals:
+                for f in self._e2_modules_named(v):
+                    r = self.file_tests(f) | self.class_users(f, "<module>")
+                    sel |= r
+                    if os.environ.get("RWX_E2_DEBUG"):
+                        log(f"  E2 lazy-import table names {f} -> {len(r)}")
+        return sel, f"{len(out['changes'])} namespace changes"
+
+    def _e2_modules_named(self, v):
+        """sqlglot modules a table value names: a dotted module path, or a module's own name."""
+        if not v or len(v) > 80 or not all(p.isidentifier() for p in v.split(".")):
+            return []
+        if "." in v:
+            rel = _mod_file(v)
+            return [rel] if rel else []
+        idx = getattr(self, "_stem_index", None)
+        if idx is None:
+            idx = self._stem_index = {}
+            for f in (SRC / "sqlglot").rglob("*.py"):
+                idx.setdefault(f.stem, []).append(f.relative_to(SRC).as_posix())
+        return idx.get(v, [])
 
     def text(self, path):
         v = self._texts.get(path)
@@ -1585,6 +1876,8 @@ class Selector:
         if not files:
             return set(), ["empty patch"]
         chosen = set()
+        e2_fallback, e2_files, e2_block, e2_expect = set(), {}, False, {}
+        e2_bind = False  # a module's set of bound names changed: registries scan namespaces
         e1_soft, e1_files = [], {}  # E1: (path, ranges, deferred tests) per function edit; patched sources
         scope_changed = {}  # sqlglot module path -> new source, for the import check
         for f in files:
@@ -1597,6 +1890,8 @@ class Selector:
             if path in CONFIG_FILES or Path(path).name == "conftest.py":
                 why.append(f"{path}: test configuration -> all")
                 return set(self.all), why
+            if old is None or new is None or new != old:
+                e2_block = True  # new, deleted or renamed files: the namespace diff does not model them
             if old is None:  # new file: nothing can depend on it unless another file changes too
                 if importable(new):
                     try:  # but it can shadow or break an import: include it in the import check
@@ -1676,6 +1971,8 @@ class Selector:
                 # the import: probe it.
                 scope_changed[old] = new_text
             narrowed = 0
+            e2_ok = E2 and old.startswith("sqlglot/") and self.e2 is not None
+            e2_prune = e2_ok and E2_PRUNE
             for kind, ranges, qualname, (lo, hi), own in regions:
                 at_import = kind == "func" and bool(own & col)
                 if at_import or ranges == [(lo, hi)]:
@@ -1707,7 +2004,13 @@ class Selector:
                 if kind == "scope":
                     # class body / module level: constants and tables are read by shared code, so
                     # also every test that used the class (or any class of the module).
-                    sel |= self.class_users(old, qualname)
+                    wide = self.class_users(old, qualname)
+                    if e2_prune and not at_import:
+                        # E2 may replace the class users and the body's line span by the readers
+                        # of what the body changed; kept as the fallback
+                        e2_fallback |= wide
+                    else:
+                        sel |= wide
                     if importable(old):
                         scope_changed[old] = new_text
                     if old.startswith("tests/"):
@@ -1717,6 +2020,8 @@ class Selector:
                     names, added, effects = top_level_changes(old_text, new_text)
                 except (SyntaxError, ValueError):
                     names, added, effects = None, None, True
+                if e2_ok and (names is None or names or added):
+                    e2_bind = True
                 helper = old.startswith("tests/") and not Path(old).name.startswith("test_")
                 if helper and effects:
                     # a side effect at the top of a test helper / package __init__ (imported at
@@ -1728,8 +2033,19 @@ class Selector:
                 else:
                     if helper and names:
                         sel |= self.package_tests(old)
-                    sel |= self.name_readers(old, names)
+                    nr = self.name_readers(old, names)
+                    if e2_prune:
+                        e2_fallback |= nr - sel  # other modules' reads show in the namespace diff
+                    else:
+                        sel |= nr
             chosen |= sel
+            if e2_ok:
+                e2_files[old] = new_text
+                e2_expect[old] = e2_expected(old, old_text, new_text)
+                if e2_expect[old] is None:
+                    e2_block = True
+            else:
+                e2_block = True
             why.append(f"{old}: {len(regions)} changed code regions ({narrowed} statement-level) -> {len(sel)}")
         if scope_changed:
             # Import-time code changed: valid syntax can still crash at import (NameError, bad table
@@ -1760,6 +2076,38 @@ class Selector:
                 why.append(f"import fails ({detail.strip().splitlines()[-1:]}) -> users of {len(files_)} modules: {len(sel)}")
             else:
                 why.append("import check ok")
+                failed = False
+        else:
+            failed = False
+        if E2 and self.e2 is not None and not E2_PRUNE:
+            # g8, add-only: registry / namespace-membership consumers of a binding change
+            if e2_bind and not failed and not e2_block and allow_probe:
+                e2sel, detail = self.e2_readers(e2_files, e2_expect, add_only=True)
+                why.append(f"g8: {detail}")
+                if e2sel:
+                    chosen |= e2sel
+                    why.append(f"g8 adds readers {len(e2sel)}")
+        elif E2 and self.e2 is not None and (e2_fallback - chosen or e2_bind):
+            # also when nothing would be pruned: a changed binding (an import or a name added /
+            # removed / rebound at module level) reaches namespace-scanning registries
+            # (subclasses(__name__, ...), module __getattr__, name-keyed tables), and the diff
+            # shows the derived registry entries and the tests that read them
+            e2sel = None
+            # the diff costs ~E2_COST_MS of CPU; the extra tests cost roughly their time spread over
+            # the workers: skip the diff when it is unlikely to pay for itself (the fallback is a
+            # superset, so this only trades cost, never safety)
+            gain = sum(self.ms[n] for n in e2_fallback - chosen) / MAX_WORKERS
+            if gain < E2_COST_MS and not e2_bind:
+                why.append(f"E2 skipped: at most {gain:.0f} ms to gain")
+            elif not failed and not e2_block and allow_probe:
+                e2sel, detail = self.e2_readers(e2_files, e2_expect)
+                why.append(f"E2: {detail}")
+            if e2sel is None:
+                chosen |= e2_fallback
+                why.append(f"E2 fallback -> {len(e2_fallback)}")
+            else:
+                chosen |= e2sel
+                why.append(f"E2 readers {len(e2sel)} instead of {len(e2_fallback)}")
         if e1_soft:
             chosen |= self.e1_check(e1_soft, e1_files, chosen, why)
         if chosen and self.untraced:

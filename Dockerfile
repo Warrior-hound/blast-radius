@@ -7,9 +7,12 @@ t=tarfile.open(fileobj=io.BytesIO(urllib.request.urlopen(u, timeout=120).read())
 t.extractall('/tmp/x', filter='data')" \
  && mv /tmp/x/sqlglot-eb11aec4be8cb2122afe713a4816662c3f0fb2fa /app-sqlglot \
  && mkdir -p /app && mv /app-sqlglot /app/sqlglot && rm -rf /tmp/x
-COPY selector.py map.json.gz e1_cutoff.py e1map.json.gz r1map.json.gz /app/
+COPY selector.py map.json.gz e1_cutoff.py e1map.json.gz r1map.json.gz e2_ns.py e2map.json.gz /app/
 # Build-time work is not charged: byte-compile the selector (the entry point imports it, so the
 # .pyc is used), write the import baseline, and the verified caches (compact map, pinned code objects).
 RUN python -m compileall -q /app/sqlglot /app/e1_cutoff.py && python -c "import compileall,sys; sys.exit(not compileall.compile_file('/app/selector.py', quiet=1))" \
- && python /app/selector.py --baseline && python /app/selector.py --precompute
+ && python /app/selector.py --baseline && python /app/selector.py --precompute \
+ && mkdir -p /app/cache && PYTHONHASHSEED=0 python -I -S /app/e2_ns.py build /app/sqlglot /app/cache/e2fp.pickle /app/cache/e2fp.canon.json
+# g8: registry / namespace-membership consumers of a binding change (E2 diff, add-only)
+ENV RWX_E2=1
 CMD ["python", "-S", "-c", "import sys; sys.path.insert(0, '/app'); import selector; selector.main()"]
